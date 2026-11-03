@@ -51,13 +51,17 @@ models/saved/
 checkpoints/
 
 # Datasets and large media files
+Datasets/
 data/raw/
 data/processed/
+data/external_hospital/
 *.zip
 *.tar.gz
 *.rar
 *.7z
 *.csv
+!data/splits/*.csv
+!data/metadata/*.csv
 *.parquet
 
 # Experiment tracking & logs

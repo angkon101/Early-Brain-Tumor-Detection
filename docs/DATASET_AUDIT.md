@@ -99,3 +99,4 @@ This document provides a comprehensive audit of all datasets currently available
    - Utilize mask pixel area to define an objective, quantifiable **Small-Tumour Detection** threshold (e.g., lower quartile of tumor area).
    - Utilize multi-view (Axial + Coronal + Sagittal) or multi-sequence MRI fusion, or cross-dataset external validation (using Epic & CSCR hospital dataset).
 2. **Pathway B (Retain strict MRI–CT fusion):** Acquire external paired MRI–CT datasets (e.g., RIDER Neuro MRI-CT, CQ500, TCIA Glioblastoma MRI/CT collections) before proceeding with model training.
+
