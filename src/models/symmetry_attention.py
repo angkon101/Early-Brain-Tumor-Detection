@@ -114,3 +114,4 @@ class SymmetryContrastiveAttention(nn.Module):
         if return_attention:
             return out, attn_weights
         return out, None
+

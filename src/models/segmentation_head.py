@@ -109,3 +109,4 @@ class DiceBCELoss(nn.Module):
         bce_loss = F.binary_cross_entropy_with_logits(logits, target)
 
         return (1.0 - self.bce_weight) * dice_loss + self.bce_weight * bce_loss
+

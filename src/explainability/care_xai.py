@@ -194,3 +194,4 @@ class CareXAI:
                 confidences.append(prob)
 
         return confidences
+

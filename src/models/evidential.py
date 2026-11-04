@@ -121,3 +121,4 @@ class EvidentialLoss(nn.Module):
         total_loss = ace_loss + annealed_kl
 
         return total_loss, ace_loss, kl
+

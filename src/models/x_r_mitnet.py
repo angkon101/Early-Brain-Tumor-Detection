@@ -212,3 +212,4 @@ class XRMiTNet(nn.Module):
             out["attention_weights"] = attention_matrices
 
         return out
+
