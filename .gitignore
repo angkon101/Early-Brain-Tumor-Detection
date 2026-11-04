@@ -50,21 +50,21 @@ venv.bak/
 models/saved/
 checkpoints/
 
-# Datasets and large media files
-data/01_primary_multitask/
-data/02_literature_benchmark/
-data/03_perturbation_robustness/
-data/04_clinical_hospital/
-data/raw/
-data/processed/
+# Medical Image Data Binaries (Ignored everywhere)
+*.jpg
+*.jpeg
+*.png
+*.dcm
+*.nii
+*.nii.gz
 *.zip
 *.tar.gz
 *.rar
 *.7z
+*.parquet
 *.csv
 !data/splits/*.csv
 !data/metadata/*.csv
-*.parquet
 
 # Experiment tracking & logs
 runs/
