@@ -1,258 +1,336 @@
+"""Comprehensive Data Organization and Stratified Split Generation for CARE-XAI Research.
+
+Processes all 4 research cohorts in data/:
+1. 01_primary_multitask: BRISC 2025 Multi-task (Detection + Segmentation + Small Tumor)
+2. 02_literature_benchmark: Standard Cleaned 7,153 (Literature Baseline Comparison)
+3. 03_perturbation_robustness: Augmented 7,200 (Degradation & Explanation Stability)
+4. 04_clinical_hospital: Epic & CSCR Hospital 12,064 (Cross-Center Clinical Generalization)
+"""
+
 import os
-import glob
-import json
+from pathlib import Path
 import numpy as np
 import pandas as pd
 from PIL import Image
-from pathlib import Path
 from sklearn.model_selection import train_test_split
 
 WORKSPACE_DIR = Path(r"E:\Brain tumor")
-DATASETS_DIR = WORKSPACE_DIR / "Datasets"
 DATA_DIR = WORKSPACE_DIR / "data"
 METADATA_DIR = DATA_DIR / "metadata"
 SPLITS_DIR = DATA_DIR / "splits"
-EXTERNAL_HOSPITAL_DIR = DATA_DIR / "external_hospital"
 
 METADATA_DIR.mkdir(parents=True, exist_ok=True)
 SPLITS_DIR.mkdir(parents=True, exist_ok=True)
 
-print("="*70)
-print("ORGANIZING DATASET FOR CARE-XAI RESEARCH PIPELINE")
-print("="*70)
+print("=" * 75)
+print("COMPREHENSIVE DATASET ORGANIZATION & SPLIT GENERATION PIPELINE")
+print("=" * 75)
 
-# ---------------------------------------------------------
-# Step 1: Process Primary Dataset (BRISC 2025)
-# ---------------------------------------------------------
-brisc_root = DATASETS_DIR / "archive (2)" / "brisc2025"
-manifest_path = brisc_root / "manifest.csv"
+# =========================================================================
+# COHORT 1: 01_primary_multitask (BRISC 2025)
+# =========================================================================
+print("\n[Cohort 1] Processing Primary Multi-Task Dataset (BRISC 2025)...")
+c1_dir = DATA_DIR / "01_primary_multitask"
+seg_train_img_dir = c1_dir / "segmentation" / "Train" / "images"
+seg_train_mask_dir = c1_dir / "segmentation" / "Train" / "masks"
+seg_test_img_dir = c1_dir / "segmentation" / "Test" / "images"
+seg_test_mask_dir = c1_dir / "segmentation" / "Test" / "masks"
+cls_train_dir = c1_dir / "classification" / "Train"
+cls_test_dir = c1_dir / "classification" / "Test"
 
-if not manifest_path.exists():
-    raise FileNotFoundError(f"BRISC manifest not found at: {manifest_path}")
+# Map segmentation pairs
+seg_pairs = []
+for split_name, img_dir, mask_dir in [
+    ("train", seg_train_img_dir, seg_train_mask_dir),
+    ("test", seg_test_img_dir, seg_test_mask_dir),
+]:
+    for img_p in img_dir.glob("*.jpg"):
+        stem = img_p.stem
+        mask_p = mask_dir / f"{stem}.png"
+        if not mask_p.exists():
+            continue
+        
+        # Parse filename tokens: brisc2025_<split>_<index>_<tumor>_<plane>_<seq>.jpg
+        parts = stem.split("_")
+        tumor_code = parts[3] if len(parts) > 3 else "unknown"
+        plane_code = parts[4] if len(parts) > 4 else "unknown"
+        code_to_tumor = {"gl": "glioma", "me": "meningioma", "pi": "pituitary", "no": "no_tumor"}
+        code_to_plane = {"ax": "axial", "co": "coronal", "sa": "sagittal"}
 
-print("\n[Step 1] Loading BRISC 2025 manifest...")
-df = pd.read_csv(manifest_path)
-print(f"Total entries in original manifest: {len(df)}")
+        seg_pairs.append({
+            "case_id": stem,
+            "filename": img_p.name,
+            "image_path": str(img_p.resolve()),
+            "mask_path": str(mask_p.resolve()),
+            "has_mask": True,
+            "tumor_label": code_to_tumor.get(tumor_code, tumor_code),
+            "tumor_code": tumor_code,
+            "plane_label": code_to_plane.get(plane_code, plane_code),
+            "plane_code": plane_code,
+            "sequence": "T1",
+            "original_split": split_name,
+            "cohort": "primary_multitask"
+        })
 
-# Separate segmentation image-mask pairs
-seg_images = df[(df['task'] == 'segmentation') & (df['is_mask'] == False)].copy()
-seg_masks = df[(df['task'] == 'segmentation') & (df['is_mask'] == True)].copy()
+print(f"  Matched {len(seg_pairs)} segmentation image-mask pairs.")
 
-# Map image filename to mask filename and relative paths
-mask_map = {}
-for _, row in seg_masks.iterrows():
-    # Mask filename corresponds to linked_image or matches image filename with .png extension
-    base_name = Path(row['filename']).stem
-    mask_map[base_name] = {
-        'mask_filename': row['filename'],
-        'mask_rel_path': row['relative_path'],
-        'mask_abs_path': str((brisc_root / row['relative_path']).resolve())
-    }
+# Compute tumor pixel areas and bounding boxes
+print("  Calculating mask areas and spatial coordinates...")
+for rec in seg_pairs:
+    with Image.open(rec["mask_path"]) as m_img:
+        m_arr = np.array(m_img)
+        t_pixels = int(np.count_nonzero(m_arr > 0))
+        rec["tumor_pixel_area"] = t_pixels
+        rec["relative_tumor_area"] = float(t_pixels / (512 * 512))
+        if t_pixels > 0:
+            y_idx, x_idx = np.where(m_arr > 0)
+            rec["bbox_x1"] = int(x_idx.min())
+            rec["bbox_y1"] = int(y_idx.min())
+            rec["bbox_x2"] = int(x_idx.max())
+            rec["bbox_y2"] = int(y_idx.max())
+            rec["bbox_width"] = int(x_idx.max() - x_idx.min() + 1)
+            rec["bbox_height"] = int(y_idx.max() - y_idx.min() + 1)
+        else:
+            rec["bbox_x1"] = rec["bbox_y1"] = rec["bbox_x2"] = rec["bbox_y2"] = 0
+            rec["bbox_width"] = rec["bbox_height"] = 0
 
-print(f"Matched {len(mask_map)} segmentation masks.")
+seg_df = pd.DataFrame(seg_pairs)
 
-# Calculate mask statistics: pixel area, bounding box, relative area
-print("\n[Step 2] Calculating ground-truth tumor spatial metrics from masks...")
-records = []
-for idx, row in seg_images.iterrows():
-    base_name = Path(row['filename']).stem
-    img_rel_path = row['relative_path']
-    img_abs_path = str((brisc_root / img_rel_path).resolve())
-    
-    mask_info = mask_map.get(base_name)
-    if not mask_info:
-        continue
-    
-    mask_abs_path = mask_info['mask_abs_path']
-    tumor_pixels = 0
-    bbox = (0, 0, 0, 0)
-    w_box, h_box = 0, 0
-    
-    if os.path.exists(mask_abs_path):
-        with Image.open(mask_abs_path) as m_img:
-            m_arr = np.array(m_img)
-            tumor_pixels = int(np.count_nonzero(m_arr > 0))
-            if tumor_pixels > 0:
-                y_idx, x_idx = np.where(m_arr > 0)
-                y1, y2 = int(y_idx.min()), int(y_idx.max())
-                x1, x2 = int(x_idx.min()), int(x_idx.max())
-                w_box = x2 - x1 + 1
-                h_box = y2 - y1 + 1
-                bbox = (x1, y1, x2, y2)
-                
-    rel_area = tumor_pixels / (row['width'] * row['height'])
-    
-    records.append({
-        'case_id': base_name,
-        'image_filename': row['filename'],
-        'mask_filename': mask_info['mask_filename'],
-        'image_rel_path': img_rel_path,
-        'mask_rel_path': mask_info['mask_rel_path'],
-        'image_path': img_abs_path,
-        'mask_path': mask_abs_path,
-        'has_mask': True,
-        'tumor_label': row['tumor_label'],
-        'tumor_code': row['tumor_code'],
-        'plane_label': row['plane_label'],
-        'plane_code': row['plane_code'],
-        'sequence': row['sequence'],
-        'width': row['width'],
-        'height': row['height'],
-        'tumor_pixel_area': tumor_pixels,
-        'relative_tumor_area': rel_area,
-        'bbox_x1': bbox[0],
-        'bbox_y1': bbox[1],
-        'bbox_x2': bbox[2],
-        'bbox_y2': bbox[3],
-        'bbox_width': w_box,
-        'bbox_height': h_box,
-        'original_split': row['split']
-    })
+# Determine small tumor threshold (25th percentile of tumor-positive area)
+pos_areas = seg_df[seg_df["tumor_pixel_area"] > 0]["tumor_pixel_area"]
+q25 = float(pos_areas.quantile(0.25))
+print(f"  Small-Tumour Threshold (Q25): {q25:.1f} pixels (~{q25/(512*512)*100:.2f}% of image area)")
 
-seg_df = pd.DataFrame(records)
-print(f"Processed {len(seg_df)} segmentation image-mask pairs.")
+seg_df["is_small_tumor"] = seg_df["tumor_pixel_area"] <= q25
+seg_df["size_category"] = np.where(seg_df["is_small_tumor"], "small", "medium_large")
 
-# Compute size percentiles for tumor-positive cases
-positive_areas = seg_df[seg_df['tumor_pixel_area'] > 0]['tumor_pixel_area']
-q25 = float(positive_areas.quantile(0.25))
-q50 = float(positive_areas.quantile(0.50))
-q75 = float(positive_areas.quantile(0.75))
-
-print(f"\nTumor Area Distribution (pixels):")
-print(f"  Min: {positive_areas.min()} px")
-print(f"  25th percentile (Small tumor threshold): {q25:.1f} px (~{q25/(512*512)*100:.2f}% of image)")
-print(f"  50th percentile (Median): {q50:.1f} px")
-print(f"  75th percentile: {q75:.1f} px")
-print(f"  Max: {positive_areas.max()} px")
-
-# Assign small_tumor flag: area <= 25th percentile
-seg_df['is_small_tumor'] = seg_df['tumor_pixel_area'] <= q25
-seg_df['size_category'] = 'medium_large'
-seg_df.loc[seg_df['is_small_tumor'], 'size_category'] = 'small'
-
-# Include Healthy Control (no_tumor) slices
-no_tumor_rows = df[(df['tumor_label'] == 'no_tumor') & (df['is_mask'] == False)].copy()
-print(f"\nAdding {len(no_tumor_rows)} healthy control slices from BRISC 2025...")
-
+# Include healthy control slices (no_tumor) from classification
 ctrl_records = []
-for idx, row in no_tumor_rows.iterrows():
-    base_name = Path(row['filename']).stem
-    img_abs_path = str((brisc_root / row['relative_path']).resolve())
-    ctrl_records.append({
-        'case_id': base_name,
-        'image_filename': row['filename'],
-        'mask_filename': 'None',
-        'image_rel_path': row['relative_path'],
-        'mask_rel_path': 'None',
-        'image_path': img_abs_path,
-        'mask_path': 'None',
-        'has_mask': False,
-        'tumor_label': 'no_tumor',
-        'tumor_code': 'no',
-        'plane_label': row['plane_label'],
-        'plane_code': row['plane_code'],
-        'sequence': row['sequence'],
-        'width': row['width'],
-        'height': row['height'],
-        'tumor_pixel_area': 0,
-        'relative_tumor_area': 0.0,
-        'bbox_x1': 0,
-        'bbox_y1': 0,
-        'bbox_x2': 0,
-        'bbox_y2': 0,
-        'bbox_width': 0,
-        'bbox_height': 0,
-        'original_split': row['split'],
-        'is_small_tumor': False,
-        'size_category': 'no_tumor'
-    })
+for split_name, cls_dir in [("train", cls_train_dir / "no_tumor"), ("test", cls_test_dir / "no_tumor")]:
+    if not cls_dir.exists():
+        continue
+    for img_p in cls_dir.glob("*.jpg"):
+        stem = img_p.stem
+        parts = stem.split("_")
+        plane_code = parts[4] if len(parts) > 4 else "unknown"
+        code_to_plane = {"ax": "axial", "co": "coronal", "sa": "sagittal"}
+
+        ctrl_records.append({
+            "case_id": stem,
+            "filename": img_p.name,
+            "image_path": str(img_p.resolve()),
+            "mask_path": "None",
+            "has_mask": False,
+            "tumor_label": "no_tumor",
+            "tumor_code": "no",
+            "plane_label": code_to_plane.get(plane_code, plane_code),
+            "plane_code": plane_code,
+            "sequence": "T1",
+            "original_split": split_name,
+            "cohort": "primary_multitask",
+            "tumor_pixel_area": 0,
+            "relative_tumor_area": 0.0,
+            "bbox_x1": 0,
+            "bbox_y1": 0,
+            "bbox_x2": 0,
+            "bbox_y2": 0,
+            "bbox_width": 0,
+            "bbox_height": 0,
+            "is_small_tumor": False,
+            "size_category": "no_tumor"
+        })
 
 ctrl_df = pd.DataFrame(ctrl_records)
-full_primary_df = pd.concat([seg_df, ctrl_df], ignore_index=True)
-print(f"Combined primary dataset size: {len(full_primary_df)} images (Tumor: {len(seg_df)}, Control: {len(ctrl_df)})")
+multitask_df = pd.concat([seg_df, ctrl_df], ignore_index=True)
+print(f"  Total Primary Multi-Task cohort size: {len(multitask_df)} cases (Tumors: {len(seg_df)}, Controls: {len(ctrl_df)})")
 
-# Save complete unified manifest
-unified_manifest_path = METADATA_DIR / "brisc2025_processed_manifest.csv"
-full_primary_df.to_csv(unified_manifest_path, index=False)
-print(f"Saved processed manifest to: {unified_manifest_path}")
+# Save complete cohort 1 manifest
+multitask_df.to_csv(METADATA_DIR / "multitask_master_manifest.csv", index=False)
 
-# ---------------------------------------------------------
-# Step 3: Stratified Data Splitting (Patient / Slice Level)
-# ---------------------------------------------------------
-print("\n[Step 3] Creating Stratified Splits (70% Train, 15% Val, 15% Test)...")
-# Stratify based on composite key: tumor_label + plane_label + size_category
-full_primary_df['strat_key'] = full_primary_df['tumor_label'] + "_" + full_primary_df['plane_label'] + "_" + full_primary_df['size_category']
+# Create stratified splits (70% train, 15% val, 15% test)
+multitask_df["strat_key"] = multitask_df["tumor_label"] + "_" + multitask_df["plane_label"] + "_" + multitask_df["size_category"]
+train_c1, temp_c1 = train_test_split(multitask_df, test_size=0.30, random_state=42, stratify=multitask_df["strat_key"])
+val_c1, test_c1 = train_test_split(temp_c1, test_size=0.50, random_state=42, stratify=temp_c1["strat_key"])
 
-train_df, temp_df = train_test_split(
-    full_primary_df, 
-    test_size=0.30, 
-    random_state=42, 
-    stratify=full_primary_df['strat_key']
-)
+small_test_c1 = test_c1[(test_c1["is_small_tumor"] == True) | (test_c1["tumor_label"] == "no_tumor")].copy()
 
-val_df, test_df = train_test_split(
-    temp_df, 
-    test_size=0.50, 
-    random_state=42, 
-    stratify=temp_df['strat_key']
-)
+train_c1.drop(columns=["strat_key"]).to_csv(SPLITS_DIR / "multitask_train.csv", index=False)
+val_c1.drop(columns=["strat_key"]).to_csv(SPLITS_DIR / "multitask_val.csv", index=False)
+test_c1.drop(columns=["strat_key"]).to_csv(SPLITS_DIR / "multitask_test.csv", index=False)
+small_test_c1.drop(columns=["strat_key"]).to_csv(SPLITS_DIR / "small_tumor_test.csv", index=False)
 
-# Extract dedicated Small-Tumour Test Set (Hypothesis H1 & H4)
-# Contains small tumors + balanced no_tumor control slices
-small_test_df = test_df[(test_df['is_small_tumor'] == True) | (test_df['tumor_label'] == 'no_tumor')].copy()
+# Also maintain standard train.csv, val.csv, test.csv for default loaders
+train_c1.drop(columns=["strat_key"]).to_csv(SPLITS_DIR / "train.csv", index=False)
+val_c1.drop(columns=["strat_key"]).to_csv(SPLITS_DIR / "val.csv", index=False)
+test_c1.drop(columns=["strat_key"]).to_csv(SPLITS_DIR / "test.csv", index=False)
 
-# Save splits
-train_path = SPLITS_DIR / "train.csv"
-val_path = SPLITS_DIR / "val.csv"
-test_path = SPLITS_DIR / "test.csv"
-small_test_path = SPLITS_DIR / "small_tumor_test.csv"
+print(f"  Saved Multi-Task Splits: Train={len(train_c1)}, Val={len(val_c1)}, Test={len(test_c1)}, SmallTumorTest={len(small_test_c1)}")
 
-train_df.drop(columns=['strat_key']).to_csv(train_path, index=False)
-val_df.drop(columns=['strat_key']).to_csv(val_path, index=False)
-test_df.drop(columns=['strat_key']).to_csv(test_path, index=False)
-small_test_df.drop(columns=['strat_key']).to_csv(small_test_path, index=False)
+# =========================================================================
+# COHORT 2: 02_literature_benchmark (Clean 7,153)
+# =========================================================================
+print("\n[Cohort 2] Processing Standard Literature Benchmark Cohort (Phase 2 - 7,153)...")
+c2_dir = DATA_DIR / "02_literature_benchmark"
+c2_records = []
 
-print(f"  Train set: {len(train_df)} samples -> {train_path}")
-print(f"  Validation set: {len(val_df)} samples -> {val_path}")
-print(f"  Test set: {len(test_df)} samples -> {test_path}")
-print(f"  Small-Tumour Evaluation set: {len(small_test_df)} samples -> {small_test_path}")
-
-# ---------------------------------------------------------
-# Step 4: Index External Clinical Cohort (Epic & CSCR Hospital)
-# ---------------------------------------------------------
-print("\n[Step 4] Indexing External Clinical Hospital Dataset...")
-hospital_records = []
-if EXTERNAL_HOSPITAL_DIR.exists():
-    for img_path in EXTERNAL_HOSPITAL_DIR.glob("**/*.*"):
-        if img_path.suffix.lower() in ['.jpg', '.jpeg', '.png']:
-            parts = img_path.relative_to(EXTERNAL_HOSPITAL_DIR).parts
-            # Path structure: split/class/filename
-            split_name = parts[0].lower() if len(parts) > 1 else 'unknown'
-            tumor_class = parts[1].lower() if len(parts) > 2 else 'unknown'
-            hospital_records.append({
-                'filename': img_path.name,
-                'rel_path': str(img_path.relative_to(WORKSPACE_DIR)),
-                'image_path': str(img_path.resolve()),
-                'split': split_name,
-                'tumor_label': tumor_class,
-                'source': 'Epic_CSCR_Hospital'
+for split_folder in ["Train", "Test"]:
+    s_dir = c2_dir / split_folder
+    if not s_dir.exists():
+        continue
+    for class_folder in s_dir.iterdir():
+        if not class_folder.is_dir():
+            continue
+        c_label = class_folder.name.lower().replace("notumor", "no_tumor")
+        for img_p in class_folder.glob("*.jpg"):
+            c2_records.append({
+                "case_id": img_p.stem,
+                "filename": img_p.name,
+                "image_path": str(img_p.resolve()),
+                "mask_path": "None",
+                "has_mask": False,
+                "tumor_label": c_label,
+                "split": split_folder.lower(),
+                "cohort": "literature_benchmark"
             })
 
-hosp_df = pd.DataFrame(hospital_records)
-if len(hosp_df) > 0:
-    hosp_manifest_path = METADATA_DIR / "external_hospital_manifest.csv"
-    hosp_test_path = SPLITS_DIR / "external_hospital_test.csv"
-    hosp_df.to_csv(hosp_manifest_path, index=False)
-    # The dedicated test split of external hospital dataset
-    hosp_test = hosp_df[hosp_df['split'] == 'test']
-    if len(hosp_test) == 0:
-        hosp_test = hosp_df
-    hosp_test.to_csv(hosp_test_path, index=False)
-    print(f"Indexed {len(hosp_df)} hospital clinical images.")
-    print(f"Saved external test split ({len(hosp_test)} images) to: {hosp_test_path}")
-else:
-    print("External hospital folder not yet populated or still extracting.")
+c2_df = pd.DataFrame(c2_records)
+c2_df.to_csv(METADATA_DIR / "literature_benchmark_manifest.csv", index=False)
+c2_df[c2_df["split"] == "train"].to_csv(SPLITS_DIR / "literature_benchmark_train.csv", index=False)
+c2_df[c2_df["split"] == "test"].to_csv(SPLITS_DIR / "literature_benchmark_test.csv", index=False)
+print(f"  Indexed {len(c2_df)} images (Train: {len(c2_df[c2_df['split'] == 'train'])}, Test: {len(c2_df[c2_df['split'] == 'test'])})")
 
-print("\n" + "="*70)
-print("DATASET ORGANIZATION COMPLETED SUCCESSFULLY!")
-print("="*70)
+# =========================================================================
+# COHORT 3: 03_perturbation_robustness (Augmented 7,200)
+# =========================================================================
+print("\n[Cohort 3] Processing Perturbation & Robustness Cohort (Phase 1 - 7,200)...")
+c3_dir = DATA_DIR / "03_perturbation_robustness"
+c3_records = []
+
+for split_folder in ["Train", "Test"]:
+    s_dir = c3_dir / split_folder
+    if not s_dir.exists():
+        continue
+    for class_folder in s_dir.iterdir():
+        if not class_folder.is_dir():
+            continue
+        c_label = class_folder.name.lower().replace("notumor", "no_tumor")
+        for img_p in class_folder.glob("*.jpg"):
+            is_augmented = "aug" in img_p.name.lower()
+            c3_records.append({
+                "case_id": img_p.stem,
+                "filename": img_p.name,
+                "image_path": str(img_p.resolve()),
+                "mask_path": "None",
+                "has_mask": False,
+                "tumor_label": c_label,
+                "is_augmented": is_augmented,
+                "split": split_folder.lower(),
+                "cohort": "perturbation_robustness"
+            })
+
+c3_df = pd.DataFrame(c3_records)
+c3_df.to_csv(METADATA_DIR / "robustness_manifest.csv", index=False)
+c3_df[c3_df["split"] == "train"].to_csv(SPLITS_DIR / "robustness_train.csv", index=False)
+c3_df[c3_df["split"] == "test"].to_csv(SPLITS_DIR / "robustness_test.csv", index=False)
+print(f"  Indexed {len(c3_df)} images (Train: {len(c3_df[c3_df['split'] == 'train'])}, Test: {len(c3_df[c3_df['split'] == 'test'])})")
+
+# =========================================================================
+# COHORT 4: 04_clinical_hospital (Epic & CSCR Hospital - 12,064)
+# =========================================================================
+print("\n[Cohort 4] Processing External Clinical Hospital Cohort (Phase 3 - 12,064)...")
+c4_dir = DATA_DIR / "04_clinical_hospital"
+c4_records = []
+
+for split_folder in ["Train", "Test"]:
+    s_dir = c4_dir / split_folder
+    if not s_dir.exists():
+        continue
+    for class_folder in s_dir.iterdir():
+        if not class_folder.is_dir():
+            continue
+        c_label = class_folder.name.lower().replace("notumor", "no_tumor")
+        for img_p in class_folder.glob("*.*"):
+            if img_p.suffix.lower() in [".jpg", ".jpeg", ".png"]:
+                c4_records.append({
+                    "case_id": img_p.stem,
+                    "filename": img_p.name,
+                    "image_path": str(img_p.resolve()),
+                    "mask_path": "None",
+                    "has_mask": False,
+                    "tumor_label": c_label,
+                    "split": split_folder.lower(),
+                    "source_hospital": "Epic_and_CSCR_Hospital",
+                    "cohort": "clinical_hospital"
+                })
+
+c4_df = pd.DataFrame(c4_records)
+c4_df.to_csv(METADATA_DIR / "clinical_hospital_manifest.csv", index=False)
+c4_df[c4_df["split"] == "train"].to_csv(SPLITS_DIR / "clinical_hospital_train.csv", index=False)
+c4_df[c4_df["split"] == "test"].to_csv(SPLITS_DIR / "clinical_hospital_test.csv", index=False)
+# Maintain external_hospital_test.csv for backward compatibility
+c4_df[c4_df["split"] == "test"].to_csv(SPLITS_DIR / "external_hospital_test.csv", index=False)
+print(f"  Indexed {len(c4_df)} scans (Train: {len(c4_df[c4_df['split'] == 'train'])}, Test: {len(c4_df[c4_df['split'] == 'test'])})")
+
+# =========================================================================
+# Master Summary Table
+# =========================================================================
+print("\n[Step 5] Compiling Master Dataset Summary Table...")
+summary_data = [
+    {
+        "Cohort ID": "01_primary_multitask",
+        "Cohort Name": "BRISC 2025 Multi-Task Development",
+        "Total Samples": len(multitask_df),
+        "Train Count": len(train_c1),
+        "Val Count": len(val_c1),
+        "Test Count": len(test_c1),
+        "Segmentation Masks": f"{len(seg_df)} radiologist masks",
+        "Modality": "T1-MRI (Axial, Coronal, Sagittal)",
+        "Classes": "Glioma, Meningioma, Pituitary, No Tumor",
+        "Research Role": "Primary training (RO1-RO4), small-tumor detection (H1), auxiliary segmentation (H4)"
+    },
+    {
+        "Cohort ID": "02_literature_benchmark",
+        "Cohort Name": "Standard Literature Benchmark (Phase 2)",
+        "Total Samples": len(c2_df),
+        "Train Count": len(c2_df[c2_df["split"] == "train"]),
+        "Val Count": "-",
+        "Test Count": len(c2_df[c2_df["split"] == "test"]),
+        "Segmentation Masks": "None",
+        "Modality": "MRI 2D Slices (512x512)",
+        "Classes": "Glioma, Meningioma, Pituitary, No Tumor",
+        "Research Role": "Direct 1:1 baseline comparison with published SOTA literature (RO6 / H1 baseline)"
+    },
+    {
+        "Cohort ID": "03_perturbation_robustness",
+        "Cohort Name": "Perturbation & Degradation Robustness (Phase 1)",
+        "Total Samples": len(c3_df),
+        "Train Count": len(c3_df[c3_df["split"] == "train"]),
+        "Val Count": "-",
+        "Test Count": len(c3_df[c3_df["split"] == "test"]),
+        "Segmentation Masks": "None",
+        "Modality": "MRI 2D Slices (Augmented/Distorted)",
+        "Classes": "Glioma, Meningioma, Pituitary, No Tumor",
+        "Research Role": "Stress-testing model stability & CARE-XAI attribution faithfulness (RO7, RO8, RQ3)"
+    },
+    {
+        "Cohort ID": "04_clinical_hospital",
+        "Cohort Name": "Epic & CSCR Hospital Clinical Validation (Phase 3)",
+        "Total Samples": len(c4_df),
+        "Train Count": len(c4_df[c4_df["split"] == "train"]),
+        "Val Count": "-",
+        "Test Count": len(c4_df[c4_df["split"] == "test"]),
+        "Segmentation Masks": "None",
+        "Modality": "Authentic Clinical MRI Scans",
+        "Classes": "Glioma, Meningioma, Pituitary, No Tumor",
+        "Research Role": "Cross-center clinical generalization and hospital domain shift evaluation"
+    }
+]
+
+summary_df = pd.DataFrame(summary_data)
+summary_df.to_csv(METADATA_DIR / "master_dataset_summary.csv", index=False)
+print(f"Master summary saved to: {METADATA_DIR / 'master_dataset_summary.csv'}")
+
+print("\n" + "=" * 75)
+print(f"ALL 4 DATASET COHORTS ORGANIZED SUCCESSFULLY!")
+print(f"Total Medical Scans Across All Cohorts: {len(multitask_df) + len(c2_df) + len(c3_df) + len(c4_df):,} images")
+print("=" * 75)

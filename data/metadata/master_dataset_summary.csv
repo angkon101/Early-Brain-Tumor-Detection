@@ -1,0 +1,5 @@
+Cohort ID,Cohort Name,Total Samples,Train Count,Val Count,Test Count,Segmentation Masks,Modality,Classes,Research Role
+01_primary_multitask,BRISC 2025 Multi-Task Development,6000,4200,900,900,4793 radiologist masks,"T1-MRI (Axial, Coronal, Sagittal)","Glioma, Meningioma, Pituitary, No Tumor","Primary training (RO1-RO4), small-tumor detection (H1), auxiliary segmentation (H4)"
+02_literature_benchmark,Standard Literature Benchmark (Phase 2),7153,5723,-,1430,None,MRI 2D Slices (512x512),"Glioma, Meningioma, Pituitary, No Tumor",Direct 1:1 baseline comparison with published SOTA literature (RO6 / H1 baseline)
+03_perturbation_robustness,Perturbation & Degradation Robustness (Phase 1),7200,5600,-,1600,None,MRI 2D Slices (Augmented/Distorted),"Glioma, Meningioma, Pituitary, No Tumor","Stress-testing model stability & CARE-XAI attribution faithfulness (RO7, RO8, RQ3)"
+04_clinical_hospital,Epic & CSCR Hospital Clinical Validation (Phase 3),12064,9650,-,2414,None,Authentic Clinical MRI Scans,"Glioma, Meningioma, Pituitary, No Tumor",Cross-center clinical generalization and hospital domain shift evaluation

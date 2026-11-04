@@ -51,10 +51,12 @@ models/saved/
 checkpoints/
 
 # Datasets and large media files
-Datasets/
+data/01_primary_multitask/
+data/02_literature_benchmark/
+data/03_perturbation_robustness/
+data/04_clinical_hospital/
 data/raw/
 data/processed/
-data/external_hospital/
 *.zip
 *.tar.gz
 *.rar
