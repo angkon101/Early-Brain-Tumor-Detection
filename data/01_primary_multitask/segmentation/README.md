@@ -14,3 +14,4 @@
   - Median ($Q_{0.50}$): 3,637.0 px
   - Max Area: 76,039 px
 - **CARE-XAI Role:** Evaluates the **Pointing Game Localization Precision** and **Intersection-over-Union (IoU)** of CARE-XAI attention maps against radiologist boundaries.
+

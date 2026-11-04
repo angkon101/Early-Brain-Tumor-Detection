@@ -17,3 +17,4 @@
   - `Test/pituitary`: 300 scans
 - **Total Images:** 6,000 scans
 - **Filename Convention:** `brisc2025_<split>_<index>_<class>_<plane>_t1.jpg`
+

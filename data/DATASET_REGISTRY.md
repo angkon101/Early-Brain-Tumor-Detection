@@ -61,3 +61,4 @@ This registry provides a complete, authoritative mapping of all dataset folders,
 - [`data/04_clinical_hospital/Test/meningioma/`](file:///e:/Brain%20tumor/data/04_clinical_hospital/Test/meningioma) $\rightarrow$ 546 clinical scans
 - [`data/04_clinical_hospital/Test/pituitary/`](file:///e:/Brain%20tumor/data/04_clinical_hospital/Test/pituitary) $\rightarrow$ 626 clinical scans
 - [`data/04_clinical_hospital/Test/notumor/`](file:///e:/Brain%20tumor/data/04_clinical_hospital/Test/notumor) $\rightarrow$ 487 clinical scans *(Hospital Controls)*
+
