@@ -1353,8 +1353,16 @@ def train_and_evaluate_pipeline(epochs=30, batch_size=24, lr=3e-4, warmup_epochs
             test_ds = UniversalBrainTumorDataset(data_dir="data", split="test", is_training=False)
             small_ds = test_ds
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=2 if device.type == 'cuda' else 0, pin_memory=(device.type == 'cuda'))
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=2 if device.type == 'cuda' else 0)
+    num_workers = 2 if device.type == 'cuda' else 0
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True, drop_last=True,
+        num_workers=num_workers, pin_memory=(device.type == 'cuda'),
+        persistent_workers=(num_workers > 0)
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, persistent_workers=(num_workers > 0)
+    )
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
     small_loader = DataLoader(small_ds, batch_size=batch_size, shuffle=False)
 
