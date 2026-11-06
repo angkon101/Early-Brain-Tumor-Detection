@@ -90,7 +90,7 @@ def auto_prepare_data():
             return False
         for root, dirs, files in os.walk(p):
             for f in files:
-                if f.lower().endswith(('.jpg', '.jpeg', '.png')):
+                if f.lower().endswith(('.jpg', '.jpeg', '.png')) and "mask" not in f.lower():
                     return True
         return False
 
@@ -102,7 +102,7 @@ def auto_prepare_data():
         "/content/Early-Brain-Tumor-Detection/data",
     ]:
         if has_images(cand_dir):
-            print(f"[OK] Verified: Real MRI scans & masks present in '{cand_dir}'.")
+            print(f"[OK] Verified: Real MRI scans present in '{cand_dir}'.")
             return
 
     print("[*] MRI images not yet extracted. Scanning for uploaded .zip files...")
@@ -118,10 +118,7 @@ def auto_prepare_data():
     for s_dir in search_dirs:
         if s_dir.is_dir():
             for zf in s_dir.glob("*.zip"):
-                if zipfile.is_zipfile(zf):
-                    zip_candidates.append(zf)
-                else:
-                    print(f"[*] Skipping invalid/corrupted zip: {zf.name} ({zf.stat().st_size} bytes)")
+                zip_candidates.append(zf)
 
     target_zip = None
     for zf in zip_candidates:
@@ -134,15 +131,24 @@ def auto_prepare_data():
         target_zip = zip_candidates[0]
 
     if target_zip is not None and target_zip.is_file():
+        print(f"[ZIP] Found uploaded dataset archive at: '{target_zip}' ({target_zip.stat().st_size / 1e6:.1f} MB)")
+        print(f"      Unzipping files into '{Path.cwd().resolve()}'...")
+        extracted = False
         try:
-            print(f"[ZIP] Found valid uploaded dataset archive at: '{target_zip}'")
-            print(f"      Unzipping files into '{Path.cwd().resolve()}' (takes ~15 seconds)...")
             with zipfile.ZipFile(target_zip, "r") as z:
                 z.extractall(Path.cwd())
+            extracted = True
+        except Exception as e:
+            # Fallback to linux command unzip if python zipfile hits central dir issues
+            ret = os.system(f"unzip -o -q '{target_zip}' -d '{Path.cwd()}'")
+            if ret == 0:
+                extracted = True
+
+        if extracted:
             print("[OK] Extraction complete! All MRI images & masks are now available.")
             return
-        except Exception as e:
-            print(f"[Warning] Could not extract '{target_zip}': {e}")
+
+    print("[!] Could not auto-extract zip archive. Run: !unzip -o -q /content/*.zip -d /content/Early-Brain-Tumor-Detection/")
 
     print("[!] Could not locate zip archive automatically. In Colab run: !unzip -q /content/*.zip")
 
@@ -676,24 +682,36 @@ def analyze_image_features(image_path: Path) -> Dict[str, float]:
 
 def scan_all_dataset_folders(data_dir: Union[str, Path] = "data", max_samples_per_folder: int = 100) -> Tuple[Dict[str, Dict], Dict[str, List[Dict]]]:
     """Recursively walks every folder in data_dir, identifies classes, and learns feature distributions."""
-    data_path = Path(data_dir)
-    print(f"\n{'='*75}\nRECURSIVE DATASET FOLDER SCANNER & FEATURE LEARNING ENGINE\nScanning directory: {data_path.resolve()}\n{'='*75}")
+    candidates = [
+        Path(data_dir),
+        Path.cwd() / "data",
+        Path("/content/data"),
+        Path("/content/Early-Brain-Tumor-Detection/data"),
+        Path.cwd()
+    ]
+
+    all_images = []
+    chosen_path = Path(data_dir)
+    for cand in candidates:
+        if cand.is_dir():
+            imgs = [
+                p for ext in ["*.jpg", "*.jpeg", "*.png"]
+                for p in cand.rglob(ext)
+                if "mask" not in p.name.lower() and "masks" not in [x.lower() for x in p.parts]
+            ]
+            if len(imgs) > len(all_images):
+                all_images = imgs
+                chosen_path = cand
+
+    print(f"\n{'='*75}\nRECURSIVE DATASET FOLDER SCANNER & FEATURE LEARNING ENGINE\nScanning directory: {chosen_path.resolve()}\n{'='*75}")
 
     class_names = ["no_tumor", "glioma", "meningioma", "pituitary"]
     class_aliases = {
-        "notumor": "no_tumor", "no_tumor": "no_tumor", "normal": "no_tumor", "healthy": "no_tumor",
+        "notumor": "no_tumor", "no_tumor": "no_tumor", "no-tumor": "no_tumor", "normal": "no_tumor", "healthy": "no_tumor",
         "glioma": "glioma", "gl": "glioma",
         "meningioma": "meningioma", "me": "meningioma",
         "pituitary": "pituitary", "pi": "pituitary",
     }
-
-    all_images = []
-    for ext in ["*.jpg", "*.jpeg", "*.png"]:
-        for p in data_path.rglob(ext):
-            parts_lower = [part.lower() for part in p.parts]
-            if "mask" in p.name.lower() or "masks" in parts_lower:
-                continue
-            all_images.append(p)
 
     print(f"Discovered {len(all_images):,} total MRI image scans across subfolders.")
 
@@ -703,7 +721,7 @@ def scan_all_dataset_folders(data_dir: Union[str, Path] = "data", max_samples_pe
         stem_lower = p.stem.lower()
         matched = None
         for alias, cls in class_aliases.items():
-            if alias in parts_lower or f"_{alias}_" in stem_lower or stem_lower.startswith(f"{alias}_"):
+            if any(alias in part for part in parts_lower) or f"_{alias}_" in stem_lower or stem_lower.startswith(f"{alias}_"):
                 matched = cls
                 break
         if matched:
@@ -851,21 +869,31 @@ def crawl_all_folders(data_dir: Union[str, Path] = "data") -> pd.DataFrame:
     """Recursively walks every folder in data_dir to discover all MRI scans,
     matches labels from directory names or filename tokens, and pairs masks when present.
     """
-    data_path = Path(data_dir)
+    candidates = [
+        Path(data_dir),
+        Path.cwd() / "data",
+        Path("/content/data"),
+        Path("/content/Early-Brain-Tumor-Detection/data"),
+        Path.cwd()
+    ]
+
+    all_images = []
+    for cand in candidates:
+        if cand.is_dir():
+            imgs = [
+                p for ext in ["*.jpg", "*.jpeg", "*.png"]
+                for p in cand.rglob(ext)
+                if "mask" not in p.name.lower() and "masks" not in [x.lower() for x in p.parts]
+            ]
+            if len(imgs) > len(all_images):
+                all_images = imgs
+
     class_aliases = {
-        "notumor": "no_tumor", "no_tumor": "no_tumor", "normal": "no_tumor", "healthy": "no_tumor",
+        "notumor": "no_tumor", "no_tumor": "no_tumor", "no-tumor": "no_tumor", "normal": "no_tumor", "healthy": "no_tumor",
         "glioma": "glioma", "gl": "glioma",
         "meningioma": "meningioma", "me": "meningioma",
         "pituitary": "pituitary", "pi": "pituitary",
     }
-
-    all_images = []
-    for ext in ["*.jpg", "*.jpeg", "*.png"]:
-        for p in data_path.rglob(ext):
-            parts_lower = [part.lower() for part in p.parts]
-            if "mask" in p.name.lower() or "masks" in parts_lower:
-                continue
-            all_images.append(p)
 
     records = []
     for p in all_images:
@@ -874,7 +902,7 @@ def crawl_all_folders(data_dir: Union[str, Path] = "data") -> pd.DataFrame:
 
         matched_label = None
         for alias, cls_name in class_aliases.items():
-            if alias in parts_lower or f"_{alias}_" in stem_lower or stem_lower.startswith(f"{alias}_"):
+            if any(alias in part for part in parts_lower) or f"_{alias}_" in stem_lower or stem_lower.startswith(f"{alias}_"):
                 matched_label = cls_name
                 break
 
@@ -956,7 +984,10 @@ class UniversalBrainTumorDataset(Dataset):
         row = self.df.iloc[idx]
         img_p = resolve_file_path(row["image_path"], self.data_root)
         if img_p is None or not img_p.is_file():
-            raise FileNotFoundError(f"Cannot find MRI scan at: {row['image_path']}")
+            if Path(row["image_path"]).is_file():
+                img_p = Path(row["image_path"])
+            else:
+                raise FileNotFoundError(f"Cannot find MRI scan at: {row['image_path']}")
 
         img_pil = Image.open(img_p).convert("L")
         has_mask = bool(row.get("has_mask", False))
@@ -1029,7 +1060,10 @@ class BrainTumorDataset(Dataset):
         row = self.df.iloc[idx]
         img_p = resolve_file_path(row["image_path"], self.data_root)
         if img_p is None or not img_p.is_file():
-            raise FileNotFoundError(f"Cannot find MRI scan at: {row['image_path']}")
+            if Path(row["image_path"]).is_file():
+                img_p = Path(row["image_path"])
+            else:
+                raise FileNotFoundError(f"Cannot find MRI scan at: {row['image_path']}")
 
         img_pil = Image.open(img_p).convert("L")
 
@@ -1395,7 +1429,7 @@ def generate_all_7_figures(metrics: Dict, y_true: np.ndarray, y_probs: np.ndarra
 # STEP 5: DEEP MULTI-TASK TRAINING PIPELINE (WITH WARMUP & FOCAL LOSS)
 # ==============================================================================
 
-def train_and_evaluate_pipeline(epochs=30, batch_size=24, lr=3e-4, warmup_epochs=3, dataset_mode="auto"):
+def train_and_evaluate_pipeline(epochs=30, batch_size=24, lr=3e-4, warmup_epochs=3, dataset_mode="universal"):
     """Executes high-capacity training with Linear Warmup, Focal Evidential Loss, and TTA."""
     print(f"\n{'='*75}\n[STEP 1/3] PROFILING DATASET FOLDERS & LEARNING RADIOLOGICAL SIGNATURES\n{'='*75}")
     profiles, raw_feats = scan_all_dataset_folders(data_dir="data", max_samples_per_folder=100)
@@ -1799,8 +1833,8 @@ def launch_gradio_web_app():
 # EXECUTION ENTRY POINT
 # ==============================================================================
 if __name__ == "__main__":
-    # Deep Multi-Task Training with Warmup and Focal Evidential Loss
-    trained_model = train_and_evaluate_pipeline(epochs=30, batch_size=24, lr=3e-4, warmup_epochs=3)
+    # Deep Multi-Task Training with Warmup and Focal Evidential Loss across all subfolders
+    trained_model = train_and_evaluate_pipeline(epochs=30, batch_size=24, lr=3e-4, warmup_epochs=3, dataset_mode="universal")
 
     # In-Notebook Interactive Uploader
     print("\n[Launching In-Notebook Interactive Uploader Widget]")
