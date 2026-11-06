@@ -45,6 +45,8 @@ def evaluate_dataset(
     model: XRMiTNet,
     loader: DataLoader,
     device: torch.device,
+    compute_bootstrap: bool = False,
+    n_bootstraps: int = 1000,
 ) -> Tuple[Dict, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Runs inference across all test samples and computes journal metrics."""
     model.eval()
@@ -89,12 +91,14 @@ def evaluate_dataset(
     uncertainties = np.array(all_unc)
     all_imgs_arr = np.concatenate(all_images, axis=0)
 
-    # Classification Metrics
+    # Classification Metrics (with optional 95% bootstrap CIs)
     metrics = compute_comprehensive_classification_metrics(
         y_true=y_true,
         y_pred=y_pred,
         y_probs=y_probs,
         uncertainties=uncertainties,
+        compute_bootstrap=compute_bootstrap,
+        n_bootstraps=n_bootstraps,
     )
 
     # Segmentation Metrics
@@ -147,8 +151,8 @@ def run_full_journal_evaluation(
 
     model.eval()
 
-    # 2. Evaluate on Primary Test Split
-    print("\n[1/4] Evaluating Primary Multi-Task Test Cohort...")
+    # 2. Evaluate on Primary Test Split (with 95% Bootstrap CIs)
+    print("\n[1/4] Evaluating Primary Multi-Task Test Cohort (with 95% Bootstrap CIs)...")
     test_dataset = BrainTumorDataset(
         cohort="multitask", split="test", data_root=data_root, is_training=False
     )
@@ -162,7 +166,7 @@ def run_full_journal_evaluation(
         pred_masks,
         true_masks,
         test_images,
-    ) = evaluate_dataset(model, test_loader, target_device)
+    ) = evaluate_dataset(model, test_loader, target_device, compute_bootstrap=True, n_bootstraps=1000)
 
     # 3. Evaluate on Early/Small-Tumour Test Split
     print("[2/4] Evaluating Early/Small-Tumour Subgroup...")
@@ -171,6 +175,48 @@ def run_full_journal_evaluation(
     )
     small_loader = DataLoader(small_dataset, batch_size=batch_size, shuffle=False)
     small_metrics, _, _, _, _, _, _, _ = evaluate_dataset(model, small_loader, target_device)
+
+    # 3b. Evaluate Cross-Cohort Generalization if external splits exist
+    cohort_results = {
+        "Primary Multi-Task (BRISC)": test_metrics,
+        "Early / Small-Tumour Subgroup": small_metrics,
+    }
+    for c_name, c_key in [
+        ("Literature Benchmark (Cleaned)", "benchmark"),
+        ("External Clinical Hospital (Epic & CSCR)", "clinical"),
+        ("Sensor Perturbation & Robustness", "robustness"),
+    ]:
+        try:
+            c_ds = BrainTumorDataset(cohort=c_key, split="test", data_root=data_root, is_training=False)
+            c_loader = DataLoader(c_ds, batch_size=batch_size, shuffle=False)
+            print(f"  -> Evaluating External Cohort: {c_name} (N={len(c_ds)})...")
+            c_met, _, _, _, _, _, _, _ = evaluate_dataset(model, c_loader, target_device)
+            cohort_results[c_name] = c_met
+        except Exception as e:
+            print(f"  -> Cohort {c_name} skipped: {e}")
+
+    # Generate Multi-Cohort Generalization LaTeX Table
+    cohort_latex = [
+        r"\begin{table}[htbp]",
+        r"\centering",
+        r"\caption{Multi-Cohort Cross-Validation and External Generalization Performance of X-R-MiTNet.}",
+        r"\label{tab:multicohort_generalization}",
+        r"\begin{tabular}{lcccccc}",
+        r"\toprule",
+        r"\textbf{Cohort / Dataset} & \textbf{Acc (\%)} & \textbf{Bal Acc (\%)} & \textbf{Macro F1 (\%)} & \textbf{Sens (\%)} & \textbf{Spec (\%)} & \textbf{AUC-ROC} \\",
+        r"\midrule",
+    ]
+    for c_name, met in cohort_results.items():
+        acc_s = met.get("accuracy", 0.0) * 100
+        b_acc = met.get("balanced_accuracy", 0.0) * 100
+        f1_s = met.get("macro_f1", 0.0) * 100
+        sens_s = met.get("macro_recall", 0.0) * 100
+        spec_s = met.get("macro_specificity", 0.0) * 100
+        auc_s = met.get("auc_roc_macro", 0.0)
+        cohort_latex.append(f"{c_name} & {acc_s:.2f} & {b_acc:.2f} & {f1_s:.2f} & {sens_s:.2f} & {spec_s:.2f} & {auc_s:.4f} \\\\")
+    cohort_latex.extend([r"\bottomrule", r"\end{tabular}", r"\end{table}"])
+    with open(metrics_path / "table2_multicohort_generalization.tex", "w") as f:
+        f.write("\n".join(cohort_latex))
 
     # 4. Generate all 7 Publication Figures
     print("\n[3/4] Generating Journal-Grade Figures (300 DPI)...")
@@ -233,16 +279,18 @@ def run_full_journal_evaluation(
         test_metrics, small_metrics, save_path=fig_path / "fig6_small_tumor_comparison.pdf"
     )
 
-    # Figure 7: CARE-XAI Multi-Panel Clinical Interpretability
-    print("  -> Generating Fig 7: CARE-XAI Interpretability Panel...")
+    # Figure 7: CARE-XAI Multi-Panel Clinical Interpretability & Quantitative Benchmarks
+    print("  -> Generating Fig 7 & Quantitative CARE-XAI Faithfulness Benchmarks...")
     care_xai = CareXAI(model, device=str(target_device))
-    # Pick a tumor slice with mask for illustration
     sample_idx = 0
+    masked_indices = []
     for idx in range(len(test_dataset)):
         s = test_dataset[idx]
         if s["has_mask"].item() > 0.5 and s["label"].item() != 3:
-            sample_idx = idx
-            break
+            masked_indices.append(idx)
+
+    if len(masked_indices) > 0:
+        sample_idx = masked_indices[0]
 
     sample = test_dataset[sample_idx]
     sample_img = sample["image"].unsqueeze(0)  # (1, 1, 224, 224)
@@ -281,6 +329,41 @@ def run_full_journal_evaluation(
         uncertainty=pred_unc,
         save_path=fig_path / "fig7_care_xai_interpretability_panel.pdf",
     )
+
+    # Quantitative XAI Benchmarks on Masked Cohort (Pointing Game, Energy Inside Mask, Deletion/Insertion AUC)
+    pg_hits = []
+    energies = []
+    audc_scores = []
+    auic_scores = []
+    n_xai_eval = min(50, len(masked_indices))
+    if n_xai_eval > 0:
+        print(f"  -> Quantifying CARE-XAI Faithfulness across {n_xai_eval} ground-truth masked tumor scans...")
+        for m_i in tqdm(masked_indices[:n_xai_eval], desc="XAI Benchmarking", leave=False):
+            m_s = test_dataset[m_i]
+            m_img = m_s["image"].unsqueeze(0)
+            m_mask = m_s["mask"].squeeze().numpy()
+            m_lbl = m_s["label"].item()
+            m_heat = care_xai.compute_attention_rollout(m_img, discard_ratio=0.85)
+
+            pg_hits.append(care_xai.compute_pointing_game_hit(m_heat, m_mask, tolerance_pixels=5))
+            energies.append(care_xai.compute_energy_inside_mask(m_heat, m_mask))
+
+            _, _, audc, auic = care_xai.compute_deletion_insertion_curves(
+                image=m_img, heatmap=m_heat, target_class=m_lbl, steps=8
+            )
+            audc_scores.append(audc)
+            auic_scores.append(auic)
+
+        xai_report = {
+            "num_evaluated_scans": n_xai_eval,
+            "pointing_game_accuracy": float(np.mean(pg_hits)) if len(pg_hits) > 0 else 0.0,
+            "mean_energy_inside_mask": float(np.mean(energies)) if len(energies) > 0 else 0.0,
+            "mean_deletion_audc": float(np.mean(audc_scores)) if len(audc_scores) > 0 else 0.0,
+            "mean_insertion_auic": float(np.mean(auic_scores)) if len(auic_scores) > 0 else 0.0,
+        }
+        with open(metrics_path / "xai_faithfulness_report.json", "w") as f:
+            json.dump(xai_report, f, indent=2)
+        print(f"  -> XAI Faithfulness: Pointing Game Accuracy = {xai_report['pointing_game_accuracy']*100:.1f}%, Energy Inside Mask = {xai_report['mean_energy_inside_mask']*100:.1f}%")
 
     # 5. Export LaTeX Table & JSON Report
     print("\n[4/4] Exporting LaTeX Table & JSON Report...")

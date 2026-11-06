@@ -100,12 +100,87 @@ def compute_specificity_per_class(cm: np.ndarray) -> np.ndarray:
     return specificities
 
 
+def compute_bootstrap_confidence_intervals(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_probs: Optional[np.ndarray] = None,
+    n_bootstraps: int = 1000,
+    confidence_level: float = 0.95,
+    seed: int = 42,
+) -> Dict[str, Tuple[float, float]]:
+    """Calculates non-parametric percentile bootstrap 95% Confidence Intervals.
+
+    Essential for peer-reviewed medical imaging journals (IEEE TMI / Nature Med).
+    """
+    rng = np.random.RandomState(seed)
+    n_samples = len(y_true)
+    alpha_lower = (1.0 - confidence_level) / 2.0 * 100.0
+    alpha_upper = (1.0 + confidence_level) / 2.0 * 100.0
+
+    boot_acc = []
+    boot_bal_acc = []
+    boot_macro_f1 = []
+    boot_weighted_f1 = []
+    boot_macro_prec = []
+    boot_macro_rec = []
+    boot_mcc = []
+    boot_kappa = []
+    boot_auc = []
+
+    for _ in range(n_bootstraps):
+        indices = rng.randint(0, n_samples, size=n_samples)
+        b_true = y_true[indices]
+        b_pred = y_pred[indices]
+
+        # Require at least 2 distinct classes to compute metrics safely
+        if len(np.unique(b_true)) < 2:
+            continue
+
+        boot_acc.append(accuracy_score(b_true, b_pred))
+        boot_bal_acc.append(balanced_accuracy_score(b_true, b_pred))
+        boot_macro_f1.append(f1_score(b_true, b_pred, average="macro", zero_division=0))
+        boot_weighted_f1.append(f1_score(b_true, b_pred, average="weighted", zero_division=0))
+        boot_macro_prec.append(precision_score(b_true, b_pred, average="macro", zero_division=0))
+        boot_macro_rec.append(recall_score(b_true, b_pred, average="macro", zero_division=0))
+        boot_mcc.append(matthews_corrcoef(b_true, b_pred))
+        boot_kappa.append(cohen_kappa_score(b_true, b_pred))
+
+        if y_probs is not None:
+            b_probs = y_probs[indices]
+            try:
+                boot_auc.append(roc_auc_score(b_true, b_probs, multi_class="ovr", average="macro"))
+            except Exception:
+                pass
+
+    def get_ci(vals: List[float]) -> Tuple[float, float]:
+        if len(vals) == 0:
+            return (0.0, 0.0)
+        return (float(np.percentile(vals, alpha_lower)), float(np.percentile(vals, alpha_upper)))
+
+    ci_results = {
+        "accuracy": get_ci(boot_acc),
+        "balanced_accuracy": get_ci(boot_bal_acc),
+        "macro_f1": get_ci(boot_macro_f1),
+        "weighted_f1": get_ci(boot_weighted_f1),
+        "macro_precision": get_ci(boot_macro_prec),
+        "macro_recall": get_ci(boot_macro_rec),
+        "matthews_corrcoef": get_ci(boot_mcc),
+        "cohen_kappa": get_ci(boot_kappa),
+    }
+    if len(boot_auc) > 0:
+        ci_results["auc_roc_macro"] = get_ci(boot_auc)
+
+    return ci_results
+
+
 def compute_comprehensive_classification_metrics(
     y_true: Union[List[int], np.ndarray],
     y_pred: Union[List[int], np.ndarray],
     y_probs: Optional[Union[List[List[float]], np.ndarray]] = None,
     uncertainties: Optional[Union[List[float], np.ndarray]] = None,
     class_names: Optional[List[str]] = None,
+    compute_bootstrap: bool = False,
+    n_bootstraps: int = 1000,
 ) -> Dict[str, Union[float, Dict, np.ndarray]]:
     """Calculates all journal-grade metrics for multi-class tumor classification."""
     y_true = np.asarray(y_true, dtype=int)
@@ -167,7 +242,7 @@ def compute_comprehensive_classification_metrics(
         "per_class": per_class,
     }
 
-    # AUC-ROC and PR-AUC if probabilities provided
+    # AUC-ROC, PR-AUC, and Brier Score if probabilities provided
     if y_probs is not None:
         y_probs = np.asarray(y_probs, dtype=float)
         try:
@@ -177,7 +252,7 @@ def compute_comprehensive_classification_metrics(
             metrics["auc_roc_macro"] = auc_macro
             metrics["auc_roc_weighted"] = auc_weighted
 
-            # Per-class AUC
+            # Per-class AUC & PR-AUC
             y_onehot = np.eye(num_classes)[y_true]
             for c, name in enumerate(class_names):
                 if len(np.unique(y_onehot[:, c])) > 1:
@@ -189,9 +264,14 @@ def compute_comprehensive_classification_metrics(
                     metrics["per_class"][name]["auc_roc"] = 1.0
                     metrics["per_class"][name]["pr_auc"] = 1.0
 
+            # Multi-Class Brier Score: \frac{1}{N} \sum_{i=1}^N \sum_{k=1}^K (y_{ik} - p_{ik})^2
+            brier = float(np.mean(np.sum((y_onehot - y_probs) ** 2, axis=1)))
+            metrics["brier_score"] = brier
+
         except Exception as e:
             metrics["auc_roc_macro"] = 0.0
             metrics["auc_roc_weighted"] = 0.0
+            metrics["brier_score"] = 0.0
 
         # Calibration (ECE & Brier score)
         ece, bin_acc, bin_conf, bin_counts = compute_expected_calibration_error(y_true, y_probs)
@@ -220,6 +300,15 @@ def compute_comprehensive_classification_metrics(
         else:
             metrics["uncertainty_separation_t_stat"] = 0.0
             metrics["uncertainty_separation_p_value"] = 1.0
+
+    # Non-parametric Percentile Bootstrap 95% Confidence Intervals (B=1000)
+    if compute_bootstrap:
+        metrics["bootstrap_ci"] = compute_bootstrap_confidence_intervals(
+            y_true=y_true,
+            y_pred=y_pred,
+            y_probs=y_probs,
+            n_bootstraps=n_bootstraps,
+        )
 
     return metrics
 
@@ -255,16 +344,25 @@ def compute_segmentation_metrics(
 
 
 def generate_latex_table(metrics: Dict[str, Union[float, Dict]]) -> str:
-    """Generates an IEEE/Nature style LaTeX table snippet summarizing evaluation results."""
+    """Generates an IEEE/Nature style LaTeX table snippet summarizing evaluation results with 95% CIs."""
+    ci = metrics.get("bootstrap_ci", {})
+
+    def fmt_val(key: str, mult: float = 100.0, decimals: int = 2) -> str:
+        val = metrics.get(key, 0.0) * mult
+        if key in ci:
+            low, high = ci[key][0] * mult, ci[key][1] * mult
+            return f"{val:.{decimals}f} [{low:.{decimals}f}, {high:.{decimals}f}]"
+        return f"{val:.{decimals}f}"
+
     latex_lines = [
         r"\begin{table}[htbp]",
         r"\centering",
-        r"\caption{Comprehensive Multi-Task Evaluation Results of X-R-MiTNet on Brain Tumor MRI Dataset.}",
+        r"\caption{Comprehensive Evaluation of X-R-MiTNet on Multi-Cohort Brain MRI Dataset (Mean [95\% Bootstrap Confidence Intervals]).}",
         r"\label{tab:evaluation_metrics}",
         r"\begin{tabular}{lccccc}",
-        r"\hline\hline",
-        r"\textbf{Class / Metric} & \textbf{Precision (\%)} & \textbf{Recall (\%)} & \textbf{Specificity (\%)} & \textbf{F1-Score (\%)} & \textbf{AUC-ROC} \\",
-        r"\hline",
+        r"\toprule",
+        r"\textbf{Class / Subgroup} & \textbf{Precision (\%)} & \textbf{Recall / Sens (\%)} & \textbf{Specificity (\%)} & \textbf{F1-Score (\%)} & \textbf{AUC-ROC} \\",
+        r"\midrule",
     ]
 
     per_class = metrics.get("per_class", {})
@@ -277,13 +375,27 @@ def generate_latex_table(metrics: Dict[str, Union[float, Dict]]) -> str:
         latex_lines.append(f"{name} & {p:.2f} & {r:.2f} & {s:.2f} & {f1:.2f} & {auc:.4f} \\\\")
 
     latex_lines.extend([
-        r"\hline",
-        f"\\textbf{{Macro Average}} & {metrics.get('macro_precision', 0.0)*100:.2f} & {metrics.get('macro_recall', 0.0)*100:.2f} & {metrics.get('macro_specificity', 0.0)*100:.2f} & {metrics.get('macro_f1', 0.0)*100:.2f} & {metrics.get('auc_roc_macro', 0.0):.4f} \\\\",
-        f"\\textbf{{Overall Accuracy}} & \\multicolumn{{5}}{{c}}{{\\textbf{{{metrics.get('accuracy', 0.0)*100:.2f}\\%}} (Balanced: {metrics.get('balanced_accuracy', 0.0)*100:.2f}\\%)}} \\\\",
-        f"\\textbf{{Cohen's Kappa ($\\kappa$)}} & \\multicolumn{{5}}{{c}}{{{metrics.get('cohen_kappa', 0.0):.4f}}} \\\\",
-        f"\\textbf{{Matthews Corr (MCC)}} & \\multicolumn{{5}}{{c}}{{{metrics.get('matthews_corrcoef', 0.0):.4f}}} \\\\",
+        r"\midrule",
+        f"\\textbf{{Macro Average}} & {fmt_val('macro_precision')} & {fmt_val('macro_recall')} & {metrics.get('macro_specificity', 0.0)*100:.2f} & {fmt_val('macro_f1')} & {fmt_val('auc_roc_macro', 1.0, 4)} \\\\",
+        f"\\textbf{{Weighted Average}} & {metrics.get('weighted_precision', 0.0)*100:.2f} & {metrics.get('weighted_recall', 0.0)*100:.2f} & - & {fmt_val('weighted_f1')} & - \\\\",
+        r"\midrule",
+        f"\\textbf{{Overall Accuracy}} & \\multicolumn{{5}}{{c}}{{{fmt_val('accuracy')}\\% (Balanced: {fmt_val('balanced_accuracy')}\\%)}} \\\\",
+        f"\\textbf{{Cohen's Kappa ($\\kappa$)}} & \\multicolumn{{5}}{{c}}{{{fmt_val('cohen_kappa', 1.0, 4)}}} \\\\",
+        f"\\textbf{{Matthews Corr (MCC)}} & \\multicolumn{{5}}{{c}}{{{fmt_val('matthews_corrcoef', 1.0, 4)}}} \\\\",
         f"\\textbf{{Expected Calib Error (ECE)}} & \\multicolumn{{5}}{{c}}{{{metrics.get('expected_calibration_error', 0.0):.4f}}} \\\\",
-        r"\hline\hline",
+        f"\\textbf{{Brier Score}} & \\multicolumn{{5}}{{c}}{{{metrics.get('brier_score', 0.0):.4f}}} \\\\",
+    ])
+
+    if "segmentation" in metrics:
+        seg = metrics["segmentation"]
+        latex_lines.extend([
+            r"\midrule",
+            f"\\textbf{{Auxiliary Lesion Dice (DSC)}} & \\multicolumn{{5}}{{c}}{{{seg.get('dice_coefficient', 0.0)*100:.2f}\\% (IoU: {seg.get('iou_jaccard', 0.0)*100:.2f}\\%)}} \\\\",
+            f"\\textbf{{Auxiliary Mask Prec / Recall}} & \\multicolumn{{5}}{{c}}{{Precision: {seg.get('mask_precision', 0.0)*100:.2f}\\% \\quad Recall: {seg.get('mask_recall', 0.0)*100:.2f}\\%}} \\\\",
+        ])
+
+    latex_lines.extend([
+        r"\bottomrule",
         r"\end{tabular}",
         r"\end{table}",
     ])

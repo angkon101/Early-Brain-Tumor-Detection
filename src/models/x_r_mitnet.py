@@ -11,6 +11,7 @@ Advanced Multi-Task Architecture for Brain Tumor Detection and Segmentation:
 4. Dirichlet Evidential Classification Head with Multi-Scale Pooling for Calibrated Clinical Uncertainty.
 """
 
+import math
 from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
@@ -66,6 +67,7 @@ class TransformerStage(nn.Module):
         num_heads: int,
         mlp_ratio: float = 4.0,
         drop: float = 0.1,
+        enable_symmetry: bool = True,
     ):
         super().__init__()
         self.dim = dim
@@ -74,7 +76,9 @@ class TransformerStage(nn.Module):
         self.blocks = nn.ModuleList([
             nn.ModuleDict({
                 "norm1": nn.LayerNorm(dim),
-                "attn": BilateralSymmetryAttention(dim=dim, num_heads=num_heads, attn_drop=drop, proj_drop=drop),
+                "attn": BilateralSymmetryAttention(
+                    dim=dim, num_heads=num_heads, attn_drop=drop, proj_drop=drop, enable_symmetry=enable_symmetry
+                ),
                 "norm2": nn.LayerNorm(dim),
                 "mlp": nn.Sequential(
                     nn.Linear(dim, int(dim * mlp_ratio)),
@@ -180,37 +184,68 @@ class XRMiTNet(nn.Module):
         depths: List[int] = [2, 2, 4, 2],
         num_heads: List[int] = [2, 4, 8, 16],
         drop_rate: float = 0.1,
+        use_symmetry: bool = True,
+        use_overlapping_stem: bool = True,
+        use_evidential: bool = True,
+        use_segmentation: bool = True,
     ):
         super().__init__()
         self.dims = dims
         self.num_classes = num_classes
+        self.use_symmetry = use_symmetry
+        self.use_overlapping_stem = use_overlapping_stem
+        self.use_evidential = use_evidential
+        self.use_segmentation = use_segmentation
 
-        # 1. Multi-Scale Overlapping Stem: (1, 224, 224) -> (64, 56, 56)
-        self.stem = OverlappingPatchStem(in_channels=in_channels, out_channels=dims[0])
+        # 1. Multi-Scale Overlapping Stem vs Non-Overlapping Patch Projection
+        if self.use_overlapping_stem:
+            self.stem = OverlappingPatchStem(in_channels=in_channels, out_channels=dims[0])
+        else:
+            self.stem = nn.Sequential(
+                nn.Conv2d(in_channels, dims[0], kernel_size=4, stride=4, bias=False),
+                nn.BatchNorm2d(dims[0]),
+                nn.GELU(),
+            )
 
         # 2. Stage 1: 56x56
-        self.stage1 = TransformerStage(dim=dims[0], depth=depths[0], num_heads=num_heads[0], drop=drop_rate)
+        self.stage1 = TransformerStage(
+            dim=dims[0], depth=depths[0], num_heads=num_heads[0], drop=drop_rate, enable_symmetry=use_symmetry
+        )
         self.down1 = DownsampleBlock(dims[0], dims[1])
 
         # 3. Stage 2: 28x28
-        self.stage2 = TransformerStage(dim=dims[1], depth=depths[1], num_heads=num_heads[1], drop=drop_rate)
+        self.stage2 = TransformerStage(
+            dim=dims[1], depth=depths[1], num_heads=num_heads[1], drop=drop_rate, enable_symmetry=use_symmetry
+        )
         self.down2 = DownsampleBlock(dims[1], dims[2])
 
         # 4. Stage 3: 14x14 (Primary Bilateral Symmetry Attention)
-        self.stage3 = TransformerStage(dim=dims[2], depth=depths[2], num_heads=num_heads[2], drop=drop_rate)
+        self.stage3 = TransformerStage(
+            dim=dims[2], depth=depths[2], num_heads=num_heads[2], drop=drop_rate, enable_symmetry=use_symmetry
+        )
         self.down3 = DownsampleBlock(dims[2], dims[3])
 
         # 5. Stage 4: 7x7 (Global Semantic Context)
-        self.stage4 = TransformerStage(dim=dims[3], depth=depths[3], num_heads=num_heads[3], drop=drop_rate)
+        self.stage4 = TransformerStage(
+            dim=dims[3], depth=depths[3], num_heads=num_heads[3], drop=drop_rate, enable_symmetry=use_symmetry
+        )
 
-        # 6. Multi-Scale Feature Pooling for Evidential Classifier
-        # Combines Stage 3 (256) + Stage 4 (512) = 768 features
+        # 6. Multi-Scale Feature Pooling for Classifier
         classifier_dim = dims[2] + dims[3]
         self.norm_cls = nn.LayerNorm(classifier_dim)
-        self.evidential_head = EvidentialHead(in_features=classifier_dim, num_classes=num_classes, hidden_dim=256)
+
+        if self.use_evidential:
+            self.evidential_head = EvidentialHead(in_features=classifier_dim, num_classes=num_classes, hidden_dim=256)
+            self.linear_cls = None
+        else:
+            self.evidential_head = None
+            self.linear_cls = nn.Linear(classifier_dim, num_classes)
 
         # 7. Dense FPN Auxiliary Segmentation Decoder
-        self.seg_decoder = FeaturePyramidSegmentationDecoder(dims=dims)
+        if self.use_segmentation:
+            self.seg_decoder = FeaturePyramidSegmentationDecoder(dims=dims)
+        else:
+            self.seg_decoder = None
 
         self._init_weights()
 
@@ -271,14 +306,31 @@ class XRMiTNet(nn.Module):
         f_cls = torch.cat([pool3, pool4], dim=1)  # (B, 768)
         f_cls = self.norm_cls(f_cls)
 
-        # Evidential Classification
-        evidential_out = self.evidential_head(f_cls)
+        # Classification Head (Evidential Dirichlet vs Standard Softmax)
+        if self.use_evidential and self.evidential_head is not None:
+            cls_out = self.evidential_head(f_cls)
+        else:
+            logits = self.linear_cls(f_cls)
+            probs = F.softmax(logits, dim=-1)
+            # Shannon entropy as uncertainty proxy
+            ent = -torch.sum(probs * torch.log(probs + 1e-8), dim=-1) / math.log(self.num_classes)
+            cls_out = {
+                "logits": logits,
+                "probabilities": probs,
+                "uncertainty": ent,
+                "alpha": probs * 10.0 + 1.0,
+                "evidence": probs * 10.0,
+            }
 
-        # Auxiliary FPN Dense Segmentation
-        mask_logits, pred_mask = self.seg_decoder(f1, f2, f3, f4)
+        # Auxiliary FPN Dense Segmentation (if enabled)
+        if self.use_segmentation and self.seg_decoder is not None:
+            mask_logits, pred_mask = self.seg_decoder(f1, f2, f3, f4)
+        else:
+            mask_logits = torch.zeros(B, 1, 224, 224, device=x.device)
+            pred_mask = torch.zeros(B, 1, 224, 224, device=x.device)
 
         out = {
-            **evidential_out,
+            **cls_out,
             "mask_logits": mask_logits,
             "pred_mask": pred_mask,
             "stage_features": [f1, f2, f3, f4],

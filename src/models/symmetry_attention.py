@@ -27,6 +27,7 @@ class BilateralSymmetryAttention(nn.Module):
         qkv_bias: bool = True,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
+        enable_symmetry: bool = True,
     ):
         super().__init__()
         assert dim % num_heads == 0, f"dim {dim} must be divisible by num_heads {num_heads}"
@@ -34,6 +35,7 @@ class BilateralSymmetryAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = 1.0 / math.sqrt(self.head_dim)
+        self.enable_symmetry = enable_symmetry
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
@@ -41,14 +43,17 @@ class BilateralSymmetryAttention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
         # Bilateral Asymmetry Extraction Module (Depthwise + Pointwise)
-        self.asym_gate = nn.Sequential(
-            nn.Conv2d(dim, dim // 2, kernel_size=1, bias=False),
-            nn.BatchNorm2d(dim // 2),
-            nn.GELU(),
-            nn.Conv2d(dim // 2, dim, kernel_size=3, padding=1, groups=dim // 2, bias=False),
-            nn.BatchNorm2d(dim),
-            nn.Sigmoid(),
-        )
+        if self.enable_symmetry:
+            self.asym_gate = nn.Sequential(
+                nn.Conv2d(dim, dim // 2, kernel_size=1, bias=False),
+                nn.BatchNorm2d(dim // 2),
+                nn.GELU(),
+                nn.Conv2d(dim // 2, dim, kernel_size=3, padding=1, groups=dim // 2, bias=False),
+                nn.BatchNorm2d(dim),
+                nn.Sigmoid(),
+            )
+        else:
+            self.asym_gate = None
 
     def forward(
         self, x: torch.Tensor, H: int, W: int, return_attention: bool = False
@@ -60,17 +65,20 @@ class BilateralSymmetryAttention(nn.Module):
         B, N, C = x.shape
         assert N == H * W, f"Tokens count {N} != H*W ({H}*{W})"
 
-        # 1. Compute Bilateral Asymmetry Feature Map in 2D space
-        x_2d = x.transpose(1, 2).reshape(B, C, H, W)  # (B, C, H, W)
-        x_mirror = torch.flip(x_2d, dims=[-1])         # Flip horizontally across midline (c <-> W-1-c)
-        asym_diff = torch.abs(x_2d - x_mirror)         # Focal asymmetry disparity
+        # 1. Compute Bilateral Asymmetry Feature Map in 2D space (if enabled)
+        if self.enable_symmetry and self.asym_gate is not None:
+            x_2d = x.transpose(1, 2).reshape(B, C, H, W)  # (B, C, H, W)
+            x_mirror = torch.flip(x_2d, dims=[-1])         # Flip horizontally across midline (c <-> W-1-c)
+            asym_diff = torch.abs(x_2d - x_mirror)         # Focal asymmetry disparity
 
-        # Compute Asymmetry Modulation Gate ∈ [0, 1]
-        gate_2d = self.asym_gate(asym_diff)           # (B, C, H, W)
-        gate_flat = gate_2d.flatten(2).transpose(1, 2) # (B, N, C)
+            # Compute Asymmetry Modulation Gate ∈ [0, 1]
+            gate_2d = self.asym_gate(asym_diff)           # (B, C, H, W)
+            gate_flat = gate_2d.flatten(2).transpose(1, 2) # (B, N, C)
 
-        # Modulate tokens: anomalous asymmetric regions get amplified
-        x_mod = x * (1.0 + gate_flat)
+            # Modulate tokens: anomalous asymmetric regions get amplified
+            x_mod = x * (1.0 + gate_flat)
+        else:
+            x_mod = x
 
         # 2. Multi-Head Self-Attention on Modulated Sequence
         qkv = self.qkv(x_mod).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)

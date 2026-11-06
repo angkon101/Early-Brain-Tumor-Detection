@@ -95,3 +95,126 @@ class CareXAI:
             heatmap_np = np.zeros_like(heatmap_np)
 
         return heatmap_np
+
+    def compute_pointing_game_hit(
+        self, heatmap: np.ndarray, ground_truth_mask: np.ndarray, tolerance_pixels: int = 5
+    ) -> bool:
+        """Determines if the maximum attention peak falls within the radiologist ground truth mask.
+
+        Args:
+            heatmap: (224, 224) attribution heatmap
+            ground_truth_mask: (224, 224) binary mask (>0 for tumor)
+            tolerance_pixels: allowed spatial slack in pixels (e.g. 5 pixels)
+        Returns:
+            is_hit: True if attribution peak lands inside the ground truth tumor boundary
+        """
+        gt_binary = (ground_truth_mask > 0.5).astype(np.uint8)
+        if np.sum(gt_binary) == 0:
+            return False
+
+        # Find coordinate of maximum attribution
+        y_max, x_max = np.unravel_index(np.argmax(heatmap), heatmap.shape)
+
+        # Direct hit check
+        if gt_binary[y_max, x_max] == 1:
+            return True
+
+        # Check with tolerance radius
+        H, W = heatmap.shape
+        y_min = max(0, y_max - tolerance_pixels)
+        y_max_bound = min(H, y_max + tolerance_pixels + 1)
+        x_min = max(0, x_max - tolerance_pixels)
+        x_max_bound = min(W, x_max + tolerance_pixels + 1)
+
+        neighborhood = gt_binary[y_min:y_max_bound, x_min:x_max_bound]
+        return bool(np.sum(neighborhood) > 0)
+
+    def compute_energy_inside_mask(
+        self, heatmap: np.ndarray, ground_truth_mask: np.ndarray
+    ) -> float:
+        """Computes the proportion of attribution energy localized inside the radiologist mask.
+
+        E = \frac{\sum_{(x,y) \in Mask} Heatmap(x,y)}{\sum_{(x,y)} Heatmap(x,y)}
+        """
+        total_energy = float(np.sum(heatmap))
+        if total_energy < 1e-8:
+            return 0.0
+
+        gt_binary = (ground_truth_mask > 0.5).astype(float)
+        inside_energy = float(np.sum(heatmap * gt_binary))
+        return inside_energy / total_energy
+
+    def compute_deletion_insertion_curves(
+        self,
+        image: torch.Tensor,
+        heatmap: np.ndarray,
+        target_class: int,
+        steps: int = 10,
+    ) -> Tuple[np.ndarray, np.ndarray, float, float]:
+        """Calculates Deletion and Insertion curves for quantitative explanation faithfulness.
+
+        - Deletion Curve: Progressively removes top-attributed pixels and measures drop in target probability.
+          Lower Area Under Deletion Curve (AUDC) = More faithful explanation.
+        - Insertion Curve: Progressively introduces top-attributed pixels into a baseline and measures probability gain.
+          Higher Area Under Insertion Curve (AUIC) = More faithful explanation.
+
+        Args:
+            image: (1, 1, 224, 224) input tensor
+            heatmap: (224, 224) attribution map
+            target_class: class index to track
+            steps: number of perturbation fractions (e.g., 10 steps = 0% to 100%)
+        Returns:
+            (del_curve, ins_curve, audc, auic)
+        """
+        device = self.device
+        img_np = image.squeeze().cpu().numpy()
+        H, W = img_np.shape
+        total_pixels = H * W
+
+        # Sort pixel indices by descending attribution value
+        flat_heat = heatmap.reshape(-1)
+        sorted_indices = np.argsort(flat_heat)[::-1]
+
+        del_probs = []
+        ins_probs = []
+
+        fractions = np.linspace(0.0, 1.0, steps + 1)
+
+        # Baseline reference: constant neutral value (0.0)
+        baseline = np.zeros_like(img_np)
+
+        with torch.no_grad():
+            for frac in fractions:
+                num_remove = int(total_pixels * frac)
+
+                # 1. Deletion test: mask out top pixels
+                del_img = img_np.copy().reshape(-1)
+                if num_remove > 0:
+                    del_img[sorted_indices[:num_remove]] = baseline.reshape(-1)[sorted_indices[:num_remove]]
+                del_t = torch.from_numpy(del_img.reshape(1, 1, H, W)).float().to(device)
+                p_del = self.model(del_t)["probabilities"][0, target_class].item()
+                del_probs.append(p_del)
+
+                # 2. Insertion test: insert top pixels into baseline
+                ins_img = baseline.copy().reshape(-1)
+                if num_remove > 0:
+                    ins_img[sorted_indices[:num_remove]] = img_np.reshape(-1)[sorted_indices[:num_remove]]
+                ins_t = torch.from_numpy(ins_img.reshape(1, 1, H, W)).float().to(device)
+                p_ins = self.model(ins_t)["probabilities"][0, target_class].item()
+                ins_probs.append(p_ins)
+
+        del_curve = np.array(del_probs)
+        ins_curve = np.array(ins_probs)
+
+        # Numerical integration using trapezoidal rule (compatible with NumPy 1.x & 2.x)
+        def _trapz(y: np.ndarray, x: np.ndarray) -> float:
+            if hasattr(np, "trapezoid"):
+                return float(np.trapezoid(y, x))
+            elif hasattr(np, "trapz"):
+                return float(getattr(np, "trapz")(y, x))
+            return float(np.sum(0.5 * (y[:-1] + y[1:]) * np.diff(x)))
+
+        audc = _trapz(del_curve, fractions)
+        auic = _trapz(ins_curve, fractions)
+
+        return del_curve, ins_curve, audc, auic

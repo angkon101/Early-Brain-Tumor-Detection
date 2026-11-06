@@ -1098,7 +1098,66 @@ def compute_expected_calibration_error(y_true: np.ndarray, y_probs: np.ndarray, 
     return float(ece), bin_accs, bin_confs
 
 
-def compute_all_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_probs: np.ndarray, uncertainties: np.ndarray):
+def compute_bootstrap_confidence_intervals(
+    y_true: np.ndarray, y_pred: np.ndarray, y_probs: Optional[np.ndarray] = None,
+    n_bootstraps: int = 1000, confidence_level: float = 0.95, seed: int = 42
+) -> Dict[str, Tuple[float, float]]:
+    """Calculates non-parametric percentile bootstrap 95% Confidence Intervals."""
+    rng = np.random.RandomState(seed)
+    n_samples = len(y_true)
+    alpha_lower = (1.0 - confidence_level) / 2.0 * 100.0
+    alpha_upper = (1.0 + confidence_level) / 2.0 * 100.0
+
+    boot_acc, boot_bal_acc, boot_macro_f1, boot_weighted_f1 = [], [], [], []
+    boot_macro_prec, boot_macro_rec, boot_mcc, boot_kappa, boot_auc = [], [], [], [], []
+
+    for _ in range(n_bootstraps):
+        indices = rng.randint(0, n_samples, size=n_samples)
+        b_true = y_true[indices]
+        b_pred = y_pred[indices]
+
+        if len(np.unique(b_true)) < 2:
+            continue
+
+        boot_acc.append(accuracy_score(b_true, b_pred))
+        boot_bal_acc.append(balanced_accuracy_score(b_true, b_pred))
+        boot_macro_f1.append(f1_score(b_true, b_pred, average="macro", zero_division=0))
+        boot_weighted_f1.append(f1_score(b_true, b_pred, average="weighted", zero_division=0))
+        boot_macro_prec.append(precision_score(b_true, b_pred, average="macro", zero_division=0))
+        boot_macro_rec.append(recall_score(b_true, b_pred, average="macro", zero_division=0))
+        boot_mcc.append(matthews_corrcoef(b_true, b_pred))
+        boot_kappa.append(cohen_kappa_score(b_true, b_pred))
+
+        if y_probs is not None:
+            try:
+                boot_auc.append(roc_auc_score(b_true, y_probs[indices], multi_class="ovr", average="macro"))
+            except Exception:
+                pass
+
+    def get_ci(vals: List[float]) -> Tuple[float, float]:
+        if len(vals) == 0:
+            return (0.0, 0.0)
+        return (float(np.percentile(vals, alpha_lower)), float(np.percentile(vals, alpha_upper)))
+
+    ci_results = {
+        "accuracy": get_ci(boot_acc),
+        "balanced_accuracy": get_ci(boot_bal_acc),
+        "macro_f1": get_ci(boot_macro_f1),
+        "weighted_f1": get_ci(boot_weighted_f1),
+        "macro_precision": get_ci(boot_macro_prec),
+        "macro_recall": get_ci(boot_macro_rec),
+        "matthews_corrcoef": get_ci(boot_mcc),
+        "cohen_kappa": get_ci(boot_kappa),
+    }
+    if len(boot_auc) > 0:
+        ci_results["auc_roc"] = get_ci(boot_auc)
+    return ci_results
+
+
+def compute_all_metrics(
+    y_true: np.ndarray, y_pred: np.ndarray, y_probs: np.ndarray,
+    uncertainties: np.ndarray, compute_bootstrap: bool = True, n_bootstraps: int = 1000
+):
     cm = confusion_matrix(y_true, y_pred, labels=list(range(4)))
     acc = float(accuracy_score(y_true, y_pred))
     bal_acc = float(balanced_accuracy_score(y_true, y_pred))
@@ -1122,6 +1181,10 @@ def compute_all_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_probs: np.ndar
     except:
         auc_roc = 0.0
 
+    # Multi-Class Brier Score
+    y_onehot = np.eye(4)[y_true]
+    brier_score = float(np.mean(np.sum((y_onehot - y_probs) ** 2, axis=1)))
+
     ece, bin_accs, bin_confs = compute_expected_calibration_error(y_true, y_probs)
 
     correct_mask = (y_pred == y_true)
@@ -1130,14 +1193,21 @@ def compute_all_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_probs: np.ndar
 
     t_stat, p_val = stats.ttest_ind(unc_error, unc_correct, equal_var=False) if len(unc_error) > 1 and len(unc_correct) > 1 else (0.0, 1.0)
 
-    return {
+    res = {
         "accuracy": acc, "balanced_accuracy": bal_acc, "matthews_corrcoef": mcc, "cohen_kappa": kappa,
         "macro_precision": macro_prec, "macro_recall": macro_rec, "macro_specificity": macro_spec,
-        "macro_f1": macro_f1, "weighted_f1": weighted_f1, "auc_roc": auc_roc,
+        "macro_f1": macro_f1, "weighted_f1": weighted_f1, "auc_roc": auc_roc, "brier_score": brier_score,
         "expected_calibration_error": ece, "bin_accs": bin_accs, "bin_confs": bin_confs,
         "confusion_matrix": cm, "mean_unc_correct": float(np.mean(unc_correct)),
         "mean_unc_error": float(np.mean(unc_error)), "uncertainty_p_value": float(p_val)
     }
+
+    if compute_bootstrap:
+        res["bootstrap_ci"] = compute_bootstrap_confidence_intervals(
+            y_true=y_true, y_pred=y_pred, y_probs=y_probs, n_bootstraps=n_bootstraps
+        )
+
+    return res
 
 
 def compute_segmentation_dice(pred_masks: np.ndarray, true_masks: np.ndarray, threshold: float = 0.5):
@@ -1540,24 +1610,34 @@ def train_and_evaluate_pipeline(epochs=30, batch_size=24, lr=3e-4, warmup_epochs
     print(f"Small-Tumour Macro F1:     {small_metrics['macro_f1']*100:.2f}%")
     print(f"=======================================================\n")
 
-    # Export Publication-Grade LaTeX Table
-    latex_table = f"""% Auto-generated IEEE/Nature Journal LaTeX Table
+    # Export Publication-Grade LaTeX Table with 95% Bootstrap Confidence Intervals
+    ci = test_metrics.get("bootstrap_ci", {})
+    def fmt_m(key, mult=100.0, dec=2):
+        v = test_metrics.get(key, 0.0) * mult
+        if key in ci:
+            l, h = ci[key][0] * mult, ci[key][1] * mult
+            return f"{v:.{dec}f} [{l:.{dec}f}, {h:.{dec}f}]"
+        return f"{v:.{dec}f}"
+
+    latex_table = f"""% Auto-generated IEEE/Nature Journal LaTeX Table with 95% Bootstrap Confidence Intervals
 \\begin{{table}}[htbp]
 \\centering
-\\caption{{Quantitative Multi-Task Evaluation of X-R-MiTNet (v2) on Brain Tumor Detection & Auxiliary Segmentation}}
+\\caption{{Quantitative Multi-Task Evaluation of X-R-MiTNet (v2) on Brain Tumor Detection & Auxiliary Segmentation (Mean [95\\% CI])}}
 \\label{{tab:tumor_results}}
 \\begin{{tabular}}{{lc|lc}}
-\\hline
-\\textbf{{Metric}} & \\textbf{{Score}} & \\textbf{{Metric}} & \\textbf{{Score}} \\\\
-\\hline
-Accuracy & {test_metrics['accuracy']*100:.2f}\\% & Balanced Accuracy & {test_metrics['balanced_accuracy']*100:.2f}\\% \\\\
-Macro F1-Score & {test_metrics['macro_f1']*100:.2f}\\% & Weighted F1-Score & {test_metrics['weighted_f1']*100:.2f}\\% \\\\
-Macro Specificity & {test_metrics['macro_specificity']*100:.2f}\\% & Macro Precision & {test_metrics['macro_precision']*100:.2f}\\% \\\\
-Macro Sensitivity (Recall) & {test_metrics['macro_recall']*100:.2f}\\% & AUC-ROC (OvR) & {test_metrics['auc_roc']:.4f} \\\\
-Cohen's Kappa ($\\kappa$) & {test_metrics['cohen_kappa']:.4f} & Matthews Corr (MCC) & {test_metrics['matthews_corrcoef']:.4f} \\\\
-Expected Calib Error (ECE) & {test_metrics['expected_calibration_error']:.4f} & Small-Tumor Recall & {small_metrics['macro_recall']*100:.2f}\\% \\\\
+\\toprule
+\\textbf{{Metric}} & \\textbf{{Score (95\\% CI)}} & \\textbf{{Metric}} & \\textbf{{Score (95\\% CI)}} \\\\
+\\midrule
+Accuracy & {fmt_m('accuracy')}\\% & Balanced Accuracy & {fmt_m('balanced_accuracy')}\\% \\\\
+Macro F1-Score & {fmt_m('macro_f1')}\\% & Weighted F1-Score & {fmt_m('weighted_f1')}\\% \\\\
+Macro Specificity & {test_metrics['macro_specificity']*100:.2f}\\% & Macro Precision & {fmt_m('macro_precision')}\\% \\\\
+Macro Sensitivity (Recall) & {fmt_m('macro_recall')}\\% & AUC-ROC (OvR) & {fmt_m('auc_roc', 1.0, 4)} \\\\
+Cohen's Kappa ($\\kappa$) & {fmt_m('cohen_kappa', 1.0, 4)} & Matthews Corr (MCC) & {fmt_m('matthews_corrcoef', 1.0, 4)} \\\\
+Expected Calib Error (ECE) & {test_metrics['expected_calibration_error']:.4f} & Brier Score & {test_metrics.get('brier_score', 0.0):.4f} \\\\
 Auxiliary Dice Score & {dice_score*100:.2f}\\% & Auxiliary IoU (Jaccard) & {iou_score*100:.2f}\\% \\\\
-\\hline
+\\midrule
+Small-Tumor Recall & {small_metrics['macro_recall']*100:.2f}\\% & Small-Tumor Macro F1 & {small_metrics['macro_f1']*100:.2f}\\% \\\\
+\\bottomrule
 \\end{{tabular}}
 \\end{{table}}
 """
