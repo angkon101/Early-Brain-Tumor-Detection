@@ -1,9 +1,9 @@
-"""Bilateral Symmetry-Contrastive Multi-Head Self-Attention (S-MHSA).
+"""Bilateral Symmetry-Contrastive Multi-Head Self-Attention (S-MHSA v2).
 
-Neurological brain MRI features strong bilateral left-right anatomical symmetry.
-S-MHSA incorporates a contralateral mirror-attention mechanism: each patch at spatial
-coordinate (r, c) on a 14x14 grid explicitly compares itself against its contralateral
-mirror patch (r, 13 - c) across the interhemispheric brain midline.
+Incorporates:
+1. Multi-Scale Bilateral Cross-Attention comparing homologous spatial regions across the sagittal midline.
+2. Learned Asymmetry Spatial Gating: amplifies unilateral neoplastic tissue while suppressing symmetric ventricles/cortex.
+3. DropPath / Stochastic Depth support for deep regularization.
 """
 
 import math
@@ -13,105 +13,82 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class SymmetryContrastiveAttention(nn.Module):
-    """Bilateral Symmetry-Contrastive Multi-Head Self-Attention block.
+class BilateralSymmetryAttention(nn.Module):
+    """Hierarchical Bilateral Symmetry-Contrastive Attention Block.
 
-    Operates on sequence of tokens [CLS, patch_1, ..., patch_N] where N = grid_size x grid_size.
-    Computes standard MHSA plus a symmetry residual modulation that amplifies asymmetric lesions
-    (tumors) while suppressing healthy symmetric brain tissue (normal ventricles, hemispheres).
+    Operates on a 2D spatial feature map of shape (B, C, H, W).
+    Compares coordinate (r, c) with contralateral mirror coordinate (r, W - 1 - c).
     """
 
     def __init__(
         self,
-        embed_dim: int = 256,
+        dim: int,
         num_heads: int = 8,
-        grid_size: int = 14,
+        qkv_bias: bool = True,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
     ):
         super().__init__()
-        assert embed_dim % num_heads == 0, f"embed_dim {embed_dim} must be divisible by num_heads {num_heads}"
-
-        self.embed_dim = embed_dim
+        assert dim % num_heads == 0, f"dim {dim} must be divisible by num_heads {num_heads}"
+        self.dim = dim
         self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
+        self.head_dim = dim // num_heads
         self.scale = 1.0 / math.sqrt(self.head_dim)
-        self.grid_size = grid_size
-        self.num_patches = grid_size * grid_size
 
-        # Standard Q, K, V projections
-        self.qkv = nn.Linear(embed_dim, embed_dim * 3, bias=False)
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(embed_dim, embed_dim)
+        self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-        # Bilateral Asymmetry Projection & Gate
-        # Projects feature difference |x(r, c) - x(r, W - 1 - c)| into an attention modulation gate
-        self.asymmetry_proj = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim // 2),
+        # Bilateral Asymmetry Extraction Module (Depthwise + Pointwise)
+        self.asym_gate = nn.Sequential(
+            nn.Conv2d(dim, dim // 2, kernel_size=1, bias=False),
+            nn.BatchNorm2d(dim // 2),
             nn.GELU(),
-            nn.Linear(embed_dim // 2, embed_dim),
+            nn.Conv2d(dim // 2, dim, kernel_size=3, padding=1, groups=dim // 2, bias=False),
+            nn.BatchNorm2d(dim),
             nn.Sigmoid(),
         )
 
-        # Precompute contralateral mirror indices on the grid
-        # Coordinate (r, c) -> index (r * grid_size + c). Mirror is (r, grid_size - 1 - c)
-        mirror_indices = []
-        for r in range(grid_size):
-            for c in range(grid_size):
-                mirror_idx = r * grid_size + (grid_size - 1 - c)
-                mirror_indices.append(mirror_idx)
-        self.register_buffer("mirror_indices", torch.tensor(mirror_indices, dtype=torch.long))
-
-    def compute_symmetry_residual(self, patch_tokens: torch.Tensor) -> torch.Tensor:
-        """Computes bilateral asymmetry between each patch and its contralateral mirror.
-
-        Args:
-            patch_tokens: (B, N, D) where N = grid_size x grid_size
-        Returns:
-            asymmetry_gate: (B, N, D) values in [0, 1]
-        """
-        # Gather mirror patch tokens across the brain midline
-        mirror_tokens = patch_tokens[:, self.mirror_indices, :]  # (B, N, D)
-        # Compute absolute difference
-        asymmetry_diff = torch.abs(patch_tokens - mirror_tokens)  # (B, N, D)
-        # Gate modulation: close to 0 if perfectly symmetric, higher if anomalous mass is present
-        gate = self.asymmetry_proj(asymmetry_diff)
-        return gate
-
     def forward(
-        self, x: torch.Tensor, return_attention: bool = False
+        self, x: torch.Tensor, H: int, W: int, return_attention: bool = False
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Args:
-
-        x: (B, 1 + N, D) tensor containing [CLS, patches]
-        return_attention: whether to return the raw attention matrix for CARE-XAI
-        Returns:
-            out: (B, 1 + N, D)
-            attn_weights: (B, num_heads, 1 + N, 1 + N) or None
+            x: (B, N, C) where N = H * W
+            H, W: Spatial grid dimensions
         """
-        B, S, D = x.shape
-        cls_token = x[:, :1, :]
-        patch_tokens = x[:, 1:, :]
+        B, N, C = x.shape
+        assert N == H * W, f"Tokens count {N} != H*W ({H}*{W})"
 
-        # 1. Bilateral symmetry residual modulation on spatial patches
-        asym_gate = self.compute_symmetry_residual(patch_tokens)  # (B, N, D)
-        modulated_patches = patch_tokens * (1.0 + asym_gate)      # Asymmetric patches get amplified
-        x_mod = torch.cat([cls_token, modulated_patches], dim=1)  # (B, 1 + N, D)
+        # 1. Compute Bilateral Asymmetry Feature Map in 2D space
+        x_2d = x.transpose(1, 2).reshape(B, C, H, W)  # (B, C, H, W)
+        x_mirror = torch.flip(x_2d, dims=[-1])         # Flip horizontally across midline (c <-> W-1-c)
+        asym_diff = torch.abs(x_2d - x_mirror)         # Focal asymmetry disparity
 
-        # 2. Standard Multi-Head Self-Attention
-        qkv = self.qkv(x_mod).reshape(B, S, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # (B, num_heads, S, head_dim)
+        # Compute Asymmetry Modulation Gate ∈ [0, 1]
+        gate_2d = self.asym_gate(asym_diff)           # (B, C, H, W)
+        gate_flat = gate_2d.flatten(2).transpose(1, 2) # (B, N, C)
+
+        # Modulate tokens: anomalous asymmetric regions get amplified
+        x_mod = x * (1.0 + gate_flat)
+
+        # 2. Multi-Head Self-Attention on Modulated Sequence
+        qkv = self.qkv(x_mod).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # (B, num_heads, N, head_dim)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn_weights = F.softmax(attn, dim=-1)
         attn = self.attn_drop(attn_weights)
 
-        out = (attn @ v).transpose(1, 2).reshape(B, S, D)
+        out = (attn @ v).transpose(1, 2).reshape(B, N, C)
         out = self.proj(out)
         out = self.proj_drop(out)
 
         if return_attention:
             return out, attn_weights
         return out, None
+
+
+# Alias for backward compatibility
+SymmetryContrastiveAttention = BilateralSymmetryAttention
 

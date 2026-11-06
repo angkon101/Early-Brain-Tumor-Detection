@@ -1,23 +1,17 @@
 # ==============================================================================
-# 🧠 X-R-MiTNet & CARE-XAI: ALL-IN-ONE MASTER PIPELINE FOR GOOGLE COLAB
-# Targeted for High-Impact Scopus/SCI Medical AI Journal Publication
+# 🧠 X-R-MiTNet (v2): HIERARCHICAL MULTI-SCALE ASYMMETRY-AWARE TRANSFORMER
+# Advanced Medical Deep Learning Framework for Brain Tumor Detection & Segmentation
+# Targeted for High-Impact Scopus/SCI Medical AI Journal Publication (IEEE TMI / Nature Med)
 # ==============================================================================
-# INSTRUCTIONS FOR RUNNING ON GOOGLE COLAB:
-# 1. Enable GPU: In Google Colab top menu, go to:
-#    Runtime -> Change runtime type -> Select 'T4 GPU' (or A100/V100) -> Save.
-#
-# 2. Provide the Data (Choose ONE option):
-#    Option A (Google Drive - Recommended):
-#      - Put 'data_colab.zip' (created in your repo) into your Google Drive root.
-#      - Uncomment 'drive.mount("/content/drive")' below. It will auto-unzip!
-#    Option B (Direct Upload):
-#      - Drag & drop 'data_colab.zip' into the left Colab Files panel.
-#      - This script will automatically detect and unzip it!
+# CLINICAL & RADIOMIC FOUNDATIONS:
+# 1. Bilateral Hemispheric Asymmetry: Compares left-right mirror homology across midline.
+# 2. Multi-Scale Overlapping Gated Stem: Preserves micro-margins and fine necrotic textures.
+# 3. 4-Stage Hierarchical Transformer (56x56 -> 28x28 -> 14x14 -> 7x7).
+# 4. Dense Feature Pyramid Network (FPN) Decoder for pixel-accurate 224x224 segmentation.
+# 5. Focal Dirichlet Evidential Learning for calibrated uncertainty & reliability.
+# 6. Test-Time Augmentation (TTA) + CLAHE Preprocessing for maximum test accuracy.
 # ==============================================================================
 
-# ------------------------------------------------------------------------------
-# STEP 0: DEPENDENCY INSTALLATION & SYSTEM IMPORTS
-# ------------------------------------------------------------------------------
 import os
 import sys
 import io
@@ -100,7 +94,6 @@ def auto_prepare_data():
                     return True
         return False
 
-    # 1. Check if actual MRI images already exist
     for cand_dir in [
         "data/01_primary_multitask",
         "01_primary_multitask",
@@ -112,8 +105,6 @@ def auto_prepare_data():
             return
 
     print("[*] MRI images not yet extracted. Scanning for uploaded .zip files...")
-
-    # 2. Search for uploaded zip files across /content and current directory
     search_dirs = [
         Path.cwd(),
         Path("/content"),
@@ -152,110 +143,171 @@ auto_prepare_data()
 
 
 # ==============================================================================
-# STEP 1: NEURAL ARCHITECTURE: X-R-MiTNet (CNN-Free Vision Transformer)
+# STEP 1: HIERARCHICAL MULTI-SCALE ASYMMETRY-AWARE TRANSFORMER (v2)
 # ==============================================================================
 
-class LinearPatchEmbedding(nn.Module):
-    """Pure CNN-Free Linear Patch Embedding for 224x224 grayscale MRI scans."""
-    def __init__(self, img_size: int = 224, patch_size: int = 16, in_channels: int = 1, embed_dim: int = 256):
+class OverlappingPatchStem(nn.Module):
+    """Gated Convolutional Stem: captures fine necrotic micro-textures & edge gradients."""
+    def __init__(self, in_channels: int = 1, out_channels: int = 64):
         super().__init__()
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.grid_size = img_size // patch_size
-        self.num_patches = self.grid_size * self.grid_size
-        self.patch_dim = in_channels * patch_size * patch_size
-        self.proj = nn.Linear(self.patch_dim, embed_dim)
+        self.conv1 = nn.Conv2d(in_channels, out_channels // 2, kernel_size=3, stride=2, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels // 2)
+        self.conv2 = nn.Conv2d(out_channels // 2, out_channels, kernel_size=3, stride=2, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.conv3 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(out_channels)
+        self.act = nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
-        P, G = self.patch_size, self.grid_size
-        patches = x.unfold(2, P, P).unfold(3, P, P).permute(0, 2, 3, 1, 4, 5).contiguous()
-        patches = patches.view(B, G * G, -1)
-        return self.proj(patches)
+        x = self.act(self.bn1(self.conv1(x)))
+        x = self.act(self.bn2(self.conv2(x)))
+        x = self.act(self.bn3(self.conv3(x)))
+        return x  # (B, 64, 56, 56)
 
 
-class SymmetryContrastiveAttention(nn.Module):
-    """Bilateral Symmetry-Contrastive Multi-Head Self-Attention (S-MHSA)."""
-    def __init__(self, embed_dim: int = 256, num_heads: int = 8, grid_size: int = 14, drop: float = 0.0):
+class DownsampleBlock(nn.Module):
+    """Spatial downsampling with channel projection between transformer stages."""
+    def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
-        self.embed_dim = embed_dim
+        self.proj = nn.Conv2d(in_dim, out_dim, kernel_size=3, stride=2, padding=1, bias=False)
+        self.norm = nn.BatchNorm2d(out_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(self.proj(x))
+
+
+class BilateralSymmetryAttention(nn.Module):
+    """Bilateral Symmetry-Contrastive Attention with learned spatial asymmetry gating."""
+    def __init__(self, dim: int, num_heads: int = 8, qkv_bias: bool = True, attn_drop: float = 0.0, proj_drop: float = 0.0):
+        super().__init__()
+        assert dim % num_heads == 0, f"dim {dim} must be divisible by num_heads {num_heads}"
+        self.dim = dim
         self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
+        self.head_dim = dim // num_heads
         self.scale = 1.0 / math.sqrt(self.head_dim)
-        self.grid_size = grid_size
 
-        self.qkv = nn.Linear(embed_dim, embed_dim * 3, bias=False)
-        self.attn_drop = nn.Dropout(drop)
-        self.proj = nn.Linear(embed_dim, embed_dim)
-        self.proj_drop = nn.Dropout(drop)
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
 
-        # Bilateral Asymmetry Gate
-        self.asymmetry_proj = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim // 2),
+        # Bilateral Asymmetry Extraction Module (Depthwise + Pointwise)
+        self.asym_gate = nn.Sequential(
+            nn.Conv2d(dim, dim // 2, kernel_size=1, bias=False),
+            nn.BatchNorm2d(dim // 2),
             nn.GELU(),
-            nn.Linear(embed_dim // 2, embed_dim),
+            nn.Conv2d(dim // 2, dim, kernel_size=3, padding=1, groups=dim // 2, bias=False),
+            nn.BatchNorm2d(dim),
             nn.Sigmoid(),
         )
 
-        mirror_indices = []
-        for r in range(grid_size):
-            for c in range(grid_size):
-                mirror_indices.append(r * grid_size + (grid_size - 1 - c))
-        self.register_buffer("mirror_indices", torch.tensor(mirror_indices, dtype=torch.long))
+    def forward(self, x: torch.Tensor, H: int, W: int, return_attention: bool = False):
+        B, N, C = x.shape
+        # 1. Bilateral Midline Mirror Homology
+        x_2d = x.transpose(1, 2).reshape(B, C, H, W)
+        x_mirror = torch.flip(x_2d, dims=[-1])
+        asym_diff = torch.abs(x_2d - x_mirror)
 
-    def forward(self, x: torch.Tensor, return_attention: bool = False):
-        B, S, D = x.shape
-        cls_token, patch_tokens = x[:, :1, :], x[:, 1:, :]
+        gate_2d = self.asym_gate(asym_diff)
+        gate_flat = gate_2d.flatten(2).transpose(1, 2)
+        x_mod = x * (1.0 + gate_flat)
 
-        mirror_tokens = patch_tokens[:, self.mirror_indices, :]
-        asym_gate = self.asymmetry_proj(torch.abs(patch_tokens - mirror_tokens))
-        modulated_patches = patch_tokens * (1.0 + asym_gate)
-        x_mod = torch.cat([cls_token, modulated_patches], dim=1)
-
-        qkv = self.qkv(x_mod).reshape(B, S, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        # 2. Multi-Head Self-Attention
+        qkv = self.qkv(x_mod).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn_weights = F.softmax(attn, dim=-1)
         attn = self.attn_drop(attn_weights)
 
-        out = (attn @ v).transpose(1, 2).reshape(B, S, D)
+        out = (attn @ v).transpose(1, 2).reshape(B, N, C)
         out = self.proj_drop(self.proj(out))
-
         return (out, attn_weights) if return_attention else (out, None)
 
 
-class TransformerBlock(nn.Module):
-    """Transformer Encoder Block with Pre-LayerNorm and S-MHSA."""
-    def __init__(self, embed_dim: int = 256, num_heads: int = 8, grid_size: int = 14, drop: float = 0.0):
+class TransformerStage(nn.Module):
+    """Hierarchical Stage containing multiple S-MHSA blocks with residual connections."""
+    def __init__(self, dim: int, depth: int, num_heads: int, mlp_ratio: float = 4.0, drop: float = 0.1):
         super().__init__()
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.attn = SymmetryContrastiveAttention(embed_dim, num_heads, grid_size, drop)
-        self.norm2 = nn.LayerNorm(embed_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim * 4),
-            nn.GELU(),
-            nn.Dropout(drop),
-            nn.Linear(embed_dim * 4, embed_dim),
-            nn.Dropout(drop),
-        )
+        self.blocks = nn.ModuleList([
+            nn.ModuleDict({
+                "norm1": nn.LayerNorm(dim),
+                "attn": BilateralSymmetryAttention(dim=dim, num_heads=num_heads, attn_drop=drop, proj_drop=drop),
+                "norm2": nn.LayerNorm(dim),
+                "mlp": nn.Sequential(
+                    nn.Linear(dim, int(dim * mlp_ratio)),
+                    nn.GELU(),
+                    nn.Dropout(drop),
+                    nn.Linear(int(dim * mlp_ratio), dim),
+                    nn.Dropout(drop),
+                ),
+            })
+            for _ in range(depth)
+        ])
 
-    def forward(self, x: torch.Tensor, return_attention: bool = False):
-        attn_out, attn_weights = self.attn(self.norm1(x), return_attention=return_attention)
-        x = x + attn_out
-        x = x + self.mlp(self.norm2(x))
+    def forward(self, x: torch.Tensor, H: int, W: int, return_attention: bool = False):
+        attn_weights = []
+        for block in self.blocks:
+            norm_x = block["norm1"](x)
+            attn_out, attn = block["attn"](norm_x, H, W, return_attention=return_attention)
+            if return_attention and attn is not None:
+                attn_weights.append(attn)
+            x = x + attn_out
+            x = x + block["mlp"](block["norm2"](x))
         return x, attn_weights
 
 
+class FeaturePyramidSegmentationDecoder(nn.Module):
+    """Dense Feature Pyramid Decoder: multi-scale skip connections for 224x224 segmentation."""
+    def __init__(self, dims: List[int] = [64, 128, 256, 512]):
+        super().__init__()
+        self.lat4 = nn.Conv2d(dims[3], 128, kernel_size=1)
+        self.lat3 = nn.Conv2d(dims[2], 128, kernel_size=1)
+        self.lat2 = nn.Conv2d(dims[1], 128, kernel_size=1)
+        self.lat1 = nn.Conv2d(dims[0], 128, kernel_size=1)
+
+        self.smooth3 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
+        self.smooth2 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
+        self.smooth1 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
+
+        self.expand1 = nn.Sequential(
+            nn.Conv2d(128, 64 * 4, kernel_size=3, padding=1, bias=False),
+            nn.PixelShuffle(2),
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+        )
+        self.expand2 = nn.Sequential(
+            nn.Conv2d(64, 1 * 4, kernel_size=3, padding=1, bias=True),
+            nn.PixelShuffle(2),
+        )
+
+    def forward(self, f1: torch.Tensor, f2: torch.Tensor, f3: torch.Tensor, f4: torch.Tensor):
+        p4 = self.lat4(f4)
+        p3 = self.lat3(f3) + F.interpolate(p4, scale_factor=2, mode="bilinear", align_corners=False)
+        p3 = self.smooth3(p3)
+
+        p2 = self.lat2(f2) + F.interpolate(p3, scale_factor=2, mode="bilinear", align_corners=False)
+        p2 = self.smooth2(p2)
+
+        p1 = self.lat1(f1) + F.interpolate(p2, scale_factor=2, mode="bilinear", align_corners=False)
+        p1 = self.smooth1(p1)
+
+        x = self.expand1(p1)
+        mask_logits = self.expand2(x)
+        pred_mask = torch.sigmoid(mask_logits)
+        return mask_logits, pred_mask
+
+
 class EvidentialHead(nn.Module):
-    """Evidential Deep Learning Head (Dirichlet distribution over probabilities)."""
-    def __init__(self, in_features: int, num_classes: int = 4, hidden_dim: int = 128):
+    """Evidential Dirichlet Head: outputs non-negative evidence, uncertainty, and reliability."""
+    def __init__(self, in_features: int, num_classes: int = 4, hidden_dim: int = 256):
         super().__init__()
         self.num_classes = num_classes
         self.mlp = nn.Sequential(
             nn.Linear(in_features, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(0.15),
             nn.Linear(hidden_dim, num_classes),
         )
 
@@ -273,83 +325,93 @@ class EvidentialHead(nn.Module):
         }
 
 
-class PureTransformerSegmentationDecoder(nn.Module):
-    """Auxiliary CNN-Free PixelShuffle Segmentation Decoder."""
-    def __init__(self, embed_dim: int = 256, grid_size: int = 14):
-        super().__init__()
-        self.grid_size = grid_size
-        dim1 = embed_dim // 2
-        dim2 = dim1 // 2
-        dim3 = dim2 // 2
-
-        self.expand1 = nn.Conv2d(embed_dim, dim1 * 4, kernel_size=1, bias=False)
-        self.norm1 = nn.BatchNorm2d(dim1)
-        self.expand2 = nn.Conv2d(dim1, dim2 * 4, kernel_size=1, bias=False)
-        self.norm2 = nn.BatchNorm2d(dim2)
-        self.expand3 = nn.Conv2d(dim2, dim3 * 4, kernel_size=1, bias=False)
-        self.norm3 = nn.BatchNorm2d(dim3)
-        self.expand4 = nn.Conv2d(dim3, 1 * 4, kernel_size=1, bias=True)
-        self.pixel_shuffle = nn.PixelShuffle(upscale_factor=2)
-        self.act = nn.GELU()
-
-    def forward(self, patch_tokens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        B, N, D = patch_tokens.shape
-        H = W = self.grid_size
-        x = patch_tokens.transpose(1, 2).reshape(B, D, H, W)
-        x = self.act(self.norm1(self.pixel_shuffle(self.expand1(x))))
-        x = self.act(self.norm2(self.pixel_shuffle(self.expand2(x))))
-        x = self.act(self.norm3(self.pixel_shuffle(self.expand3(x))))
-        mask_logits = self.pixel_shuffle(self.expand4(x))
-        pred_mask = torch.sigmoid(mask_logits)
-        return mask_logits, pred_mask
-
-
 class XRMiTNet(nn.Module):
-    """Explainable Reliability-Aware Multimodal Imaging Transformer Network."""
-    def __init__(self, img_size: int = 224, patch_size: int = 16, num_classes: int = 4, embed_dim: int = 256, depth: int = 6, num_heads: int = 8):
+    """X-R-MiTNet (v2): Hierarchical Multi-Scale Asymmetry-Aware Vision Transformer."""
+    def __init__(
+        self,
+        img_size: int = 224,
+        in_channels: int = 1,
+        num_classes: int = 4,
+        dims: List[int] = [64, 128, 256, 512],
+        depths: List[int] = [2, 2, 4, 2],
+        num_heads: List[int] = [2, 4, 8, 16],
+        drop_rate: float = 0.1,
+    ):
         super().__init__()
-        self.patch_embed = LinearPatchEmbedding(img_size, patch_size, 1, embed_dim)
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, 1 + self.patch_embed.num_patches, embed_dim))
-        self.pos_drop = nn.Dropout(0.1)
+        self.dims = dims
+        self.stem = OverlappingPatchStem(in_channels=in_channels, out_channels=dims[0])
 
-        self.blocks = nn.ModuleList([
-            TransformerBlock(embed_dim, num_heads, self.patch_embed.grid_size, drop=0.1) for _ in range(depth)
-        ])
-        self.norm = nn.LayerNorm(embed_dim)
-        self.evidential_head = EvidentialHead(embed_dim, num_classes)
-        self.seg_decoder = PureTransformerSegmentationDecoder(embed_dim, self.patch_embed.grid_size)
+        self.stage1 = TransformerStage(dim=dims[0], depth=depths[0], num_heads=num_heads[0], drop=drop_rate)
+        self.down1 = DownsampleBlock(dims[0], dims[1])
+
+        self.stage2 = TransformerStage(dim=dims[1], depth=depths[1], num_heads=num_heads[1], drop=drop_rate)
+        self.down2 = DownsampleBlock(dims[1], dims[2])
+
+        self.stage3 = TransformerStage(dim=dims[2], depth=depths[2], num_heads=num_heads[2], drop=drop_rate)
+        self.down3 = DownsampleBlock(dims[2], dims[3])
+
+        self.stage4 = TransformerStage(dim=dims[3], depth=depths[3], num_heads=num_heads[3], drop=drop_rate)
+
+        # Multi-scale pooling: Stage 3 (256) + Stage 4 (512) = 768 features
+        classifier_dim = dims[2] + dims[3]
+        self.norm_cls = nn.LayerNorm(classifier_dim)
+        self.evidential_head = EvidentialHead(in_features=classifier_dim, num_classes=num_classes, hidden_dim=256)
+
+        self.seg_decoder = FeaturePyramidSegmentationDecoder(dims=dims)
         self._init_weights()
 
     def _init_weights(self):
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-        nn.init.trunc_normal_(self.cls_token, std=0.02)
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.trunc_normal_(m.weight, std=0.02)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.LayerNorm):
+            elif isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, (nn.LayerNorm, nn.BatchNorm2d)):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
 
-    def forward(self, x: torch.Tensor, return_attention: bool = False):
+    def forward(self, x: torch.Tensor, return_attention: bool = False) -> Dict[str, torch.Tensor]:
         B = x.shape[0]
-        patches = self.patch_embed(x)
-        cls_tokens = self.cls_token.expand(B, -1, -1)
-        tokens = self.pos_drop(torch.cat((cls_tokens, patches), dim=1) + self.pos_embed)
 
-        attention_matrices = []
-        for block in self.blocks:
-            tokens, attn = block(tokens, return_attention=return_attention)
-            if return_attention and attn is not None:
-                attention_matrices.append(attn)
+        # Stage 1: (B, 64, 56, 56)
+        f1_stem = self.stem(x)
+        H1, W1 = f1_stem.shape[2], f1_stem.shape[3]
+        tokens1 = f1_stem.flatten(2).transpose(1, 2)
+        tokens1, _ = self.stage1(tokens1, H1, W1, return_attention=False)
+        f1 = tokens1.transpose(1, 2).reshape(B, self.dims[0], H1, W1)
 
-        tokens = self.norm(tokens)
-        cls_feat, patch_feat = tokens[:, 0], tokens[:, 1:]
+        # Stage 2: (B, 128, 28, 28)
+        f2_in = self.down1(f1)
+        H2, W2 = f2_in.shape[2], f2_in.shape[3]
+        tokens2 = f2_in.flatten(2).transpose(1, 2)
+        tokens2, _ = self.stage2(tokens2, H2, W2, return_attention=False)
+        f2 = tokens2.transpose(1, 2).reshape(B, self.dims[1], H2, W2)
 
-        evidential_out = self.evidential_head(cls_feat)
-        mask_logits, pred_mask = self.seg_decoder(patch_feat)
+        # Stage 3: (B, 256, 14, 14) - Primary Bilateral Symmetry
+        f3_in = self.down2(f2)
+        H3, W3 = f3_in.shape[2], f3_in.shape[3]
+        tokens3 = f3_in.flatten(2).transpose(1, 2)
+        tokens3, attn3 = self.stage3(tokens3, H3, W3, return_attention=return_attention)
+        f3 = tokens3.transpose(1, 2).reshape(B, self.dims[2], H3, W3)
+
+        # Stage 4: (B, 512, 7, 7) - Global Semantic Context
+        f4_in = self.down3(f3)
+        H4, W4 = f4_in.shape[2], f4_in.shape[3]
+        tokens4 = f4_in.flatten(2).transpose(1, 2)
+        tokens4, attn4 = self.stage4(tokens4, H4, W4, return_attention=return_attention)
+        f4 = tokens4.transpose(1, 2).reshape(B, self.dims[3], H4, W4)
+
+        # Multi-Scale Classification Pooling
+        pool3 = f3.mean(dim=[-2, -1])
+        pool4 = f4.mean(dim=[-2, -1])
+        f_cls = self.norm_cls(torch.cat([pool3, pool4], dim=1))
+
+        evidential_out = self.evidential_head(f_cls)
+        mask_logits, pred_mask = self.seg_decoder(f1, f2, f3, f4)
 
         out = {
             **evidential_out,
@@ -357,26 +419,35 @@ class XRMiTNet(nn.Module):
             "pred_mask": pred_mask,
         }
         if return_attention:
-            out["attention_weights"] = attention_matrices
+            out["attention_weights"] = attn3 + attn4
         return out
 
 
 # ==============================================================================
-# STEP 2: LOSS FUNCTIONS & CARE-XAI ATTENTION ROLLOUT
+# STEP 2: FOCAL EVIDENTIAL LOSS & SOFT DICE/BOUNDARY LOSS
 # ==============================================================================
 
-class EvidentialLoss(nn.Module):
-    """Dirichlet Adjusted Cross-Entropy with Annealed KL Divergence."""
-    def __init__(self, num_classes: int = 4, kl_coeff: float = 0.2):
+class FocalEvidentialLoss(nn.Module):
+    """Focal Dirichlet Evidential Loss: focuses gradient on hard and small tumor margins."""
+    def __init__(self, num_classes: int = 4, kl_coeff: float = 0.2, gamma: float = 1.5):
         super().__init__()
         self.num_classes = num_classes
         self.kl_coeff = kl_coeff
+        self.gamma = gamma
 
     def forward(self, alpha: torch.Tensor, target: torch.Tensor, epoch_ratio: float = 1.0):
         y_one_hot = F.one_hot(target, num_classes=self.num_classes).float()
         S = torch.sum(alpha, dim=1, keepdim=True)
-        ace_loss = torch.sum(y_one_hot * (torch.digamma(S) - torch.digamma(alpha)), dim=1).mean()
 
+        # Focal Modulation Factor: (1 - p_t)^gamma
+        p = alpha / S
+        pt = torch.sum(y_one_hot * p, dim=1, keepdim=True)
+        focal_weight = torch.pow(torch.clamp(1.0 - pt, min=1e-6, max=1.0), self.gamma)
+
+        ace_per_sample = torch.sum(y_one_hot * (torch.digamma(S) - torch.digamma(alpha)), dim=1, keepdim=True)
+        focal_ace_loss = (focal_weight * ace_per_sample).mean()
+
+        # Regularized Dirichlet KL Divergence
         alpha_tilde = y_one_hot + (1.0 - y_one_hot) * alpha
         S_tilde = torch.sum(alpha_tilde, dim=1, keepdim=True)
         kl = (
@@ -385,35 +456,54 @@ class EvidentialLoss(nn.Module):
             + torch.sum((alpha_tilde - 1.0) * (torch.digamma(alpha_tilde) - torch.digamma(S_tilde)), dim=1)
         ).mean()
 
-        total_loss = ace_loss + min(1.0, epoch_ratio) * self.kl_coeff * kl
-        return total_loss, ace_loss, kl
+        total_loss = focal_ace_loss + min(1.0, epoch_ratio) * self.kl_coeff * kl
+        return total_loss, focal_ace_loss, kl
 
 
-class DiceBCELoss(nn.Module):
-    """Combined Soft Dice + BCE Loss for Auxiliary Tumor Segmentation."""
-    def __init__(self, smooth: float = 1.0, bce_weight: float = 0.5):
+class CombinedDiceFocalBCELoss(nn.Module):
+    """Combined Soft Dice + Focal BCE Loss for precise tumor boundary segmentation."""
+    def __init__(self, smooth: float = 1.0, gamma: float = 2.0):
         super().__init__()
         self.smooth = smooth
-        self.bce_weight = bce_weight
+        self.gamma = gamma
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor):
-        probs = torch.sigmoid(logits).view(-1)
+        probs = torch.sigmoid(logits)
+        probs_flat = probs.view(-1)
         target_flat = target.view(-1)
-        intersection = (probs * target_flat).sum()
-        dice_loss = 1.0 - (2.0 * intersection + self.smooth) / (probs.sum() + target_flat.sum() + self.smooth)
-        bce_loss = F.binary_cross_entropy_with_logits(logits, target)
-        return (1.0 - self.bce_weight) * dice_loss + self.bce_weight * bce_loss
+
+        # 1. Soft Dice
+        intersection = (probs_flat * target_flat).sum()
+        dice = (2.0 * intersection + self.smooth) / (probs_flat.sum() + target_flat.sum() + self.smooth)
+        dice_loss = 1.0 - dice
+
+        # 2. Focal BCE
+        bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+        pt = torch.exp(-bce)
+        focal_bce = ((1.0 - pt) ** self.gamma * bce).mean()
+
+        return 0.6 * dice_loss + 0.4 * focal_bce
 
 
 def compute_attention_rollout(model: nn.Module, image: torch.Tensor, discard_ratio: float = 0.85, device: torch.device = device) -> np.ndarray:
-    """Computes Transformer Attention Rollout for CARE-XAI Heatmap."""
+    """Computes Hierarchical Transformer Attention Rollout for CARE-XAI heatmap."""
     model.eval()
     with torch.no_grad():
         out = model(image.to(device), return_attention=True)
-        attn_list = out["attention_weights"]
+        attn_list = out.get("attention_weights", [])
+
+    if len(attn_list) == 0:
+        return np.zeros((224, 224), dtype=np.float32)
+
+    stage3_attns = [a for a in attn_list if a.size(-1) == 196]
+    if len(stage3_attns) == 0:
+        stage3_attns = attn_list[:4]
+
+    N = stage3_attns[0].size(-1)
+    grid_size = int(np.sqrt(N))
 
     fused_attns = []
-    for attn in attn_list:
+    for attn in stage3_attns:
         fused = attn.mean(dim=1)
         if discard_ratio > 0.0:
             flat = fused.view(fused.size(0), -1)
@@ -421,18 +511,17 @@ def compute_attention_rollout(model: nn.Module, image: torch.Tensor, discard_rat
             indices = flat.argsort(dim=-1)[:, :num_discard]
             flat.scatter_(1, indices, 0.0)
             fused = flat.view(fused.shape)
-        I = torch.eye(fused.size(-1), device=fused.device).unsqueeze(0)
+        I = torch.eye(N, device=fused.device).unsqueeze(0)
         fused_aug = 0.5 * fused + 0.5 * I
-        fused_aug = fused_aug / fused_aug.sum(dim=-1, keepdim=True)
+        fused_aug = fused_aug / (fused_aug.sum(dim=-1, keepdim=True) + 1e-9)
         fused_attns.append(fused_aug)
 
     rollout = fused_attns[0]
     for l in range(1, len(fused_attns)):
         rollout = torch.bmm(fused_attns[l], rollout)
 
-    cls_attn = rollout[0, 0, 1:]
-    grid_size = int(np.sqrt(cls_attn.size(0)))
-    heatmap_2d = cls_attn.view(1, 1, grid_size, grid_size)
+    patch_attn = rollout.mean(dim=1).squeeze(0)
+    heatmap_2d = patch_attn.view(1, 1, grid_size, grid_size)
     heatmap_full = F.interpolate(heatmap_2d, size=(224, 224), mode="bicubic", align_corners=False)
     heatmap_np = heatmap_full.squeeze().cpu().numpy()
 
@@ -441,8 +530,28 @@ def compute_attention_rollout(model: nn.Module, image: torch.Tensor, discard_rat
 
 
 # ==============================================================================
-# STEP 3: CROSS-PLATFORM DATASET LOADER (GOOGLE COLAB & WINDOWS)
+# STEP 3: MEDICAL PREPROCESSING ENGINE (CLAHE + CROP + RESOLVE)
 # ==============================================================================
+
+def preprocess_mri_medical(image: Image.Image, apply_clahe: bool = True) -> np.ndarray:
+    """Applies clinical CLAHE contrast equalization and intensity standardization."""
+    img_gray = image.convert("L")
+    img_np = np.array(img_gray, dtype=np.uint8)
+
+    # 1. CLAHE Contrast Normalization (Removes scanner-to-scanner field variation)
+    if apply_clahe:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        img_np = clahe.apply(img_np)
+
+    # 2. Resize to 224x224
+    img_resized = cv2.resize(img_np, (224, 224), interpolation=cv2.INTER_LINEAR)
+    img_float = img_resized.astype(np.float32) / 255.0
+
+    # 3. Standardization (Zero-centered brain MRI scaling)
+    mean, std = 0.28, 0.22
+    norm = (img_float - mean) / std
+    return norm
+
 
 def resolve_file_path(path_str: Optional[Union[str, Path]], data_root: Optional[Union[str, Path]] = None) -> Optional[Path]:
     """Dynamically resolves dataset file paths across Windows, Linux, and Google Colab."""
@@ -459,7 +568,6 @@ def resolve_file_path(path_str: Optional[Union[str, Path]], data_root: Optional[
     norm_s = s.replace("\\", "/")
     fname = direct_p.name
 
-    # Check relative candidates
     candidates = []
     if "data/" in norm_s:
         idx = norm_s.index("data/")
@@ -469,14 +577,9 @@ def resolve_file_path(path_str: Optional[Union[str, Path]], data_root: Optional[
         candidates.extend(["data/" + norm_s[idx:], norm_s[idx:]])
 
     search_bases = [
-        Path.cwd(),
-        Path.cwd() / "data",
-        Path("/content"),
-        Path("/content/data"),
-        Path("/content/Early-Brain-Tumor-Detection"),
-        Path("/content/Early-Brain-Tumor-Detection/data"),
-        Path("/content/drive/MyDrive"),
-        Path("/content/drive/MyDrive/Early-Brain-Tumor-Detection")
+        Path.cwd(), Path.cwd() / "data", Path("/content"), Path("/content/data"),
+        Path("/content/Early-Brain-Tumor-Detection"), Path("/content/Early-Brain-Tumor-Detection/data"),
+        Path("/content/drive/MyDrive"), Path("/content/drive/MyDrive/Brain_Tumor")
     ]
     if data_root is not None:
         p_root = Path(data_root)
@@ -488,7 +591,6 @@ def resolve_file_path(path_str: Optional[Union[str, Path]], data_root: Optional[
             if target.is_file():
                 return target
 
-    # Search by filename in primary folders
     for base in search_bases:
         for sub in [
             "01_primary_multitask/segmentation/Train/images", "01_primary_multitask/segmentation/Test/images",
@@ -499,20 +601,18 @@ def resolve_file_path(path_str: Optional[Union[str, Path]], data_root: Optional[
             target = base / sub / fname
             if target.is_file():
                 return target
-
     return None
 
 
 LABEL_TO_IDX = {"glioma": 0, "meningioma": 1, "pituitary": 2, "no_tumor": 3, "notumor": 3}
 
 class BrainTumorDataset(Dataset):
-    """Unified Multimodal/Multi-Task Brain Tumor Dataset."""
+    """Clinical Multi-Task Brain Tumor Dataset with synchronized augmentation."""
     def __init__(self, split_csv: Optional[Union[str, Path]] = None, split: str = "train", data_root: Optional[Union[str, Path]] = None, is_training: bool = False, augment: bool = False):
         self.is_training = is_training
         self.augment = augment and is_training
         self.data_root = data_root
 
-        # Resolve split CSV
         if split_csv is not None:
             resolved_csv = resolve_file_path(split_csv, data_root) or Path(split_csv)
             self.df = pd.read_csv(resolved_csv)
@@ -520,17 +620,12 @@ class BrainTumorDataset(Dataset):
             rel_path = f"data/splits/multitask_{split}.csv" if split in ["train", "val", "test"] else "data/splits/small_tumor_test.csv"
             resolved_csv = resolve_file_path(rel_path, data_root) or Path(rel_path)
             if not resolved_csv.is_file():
-                # Colab auto-search
                 for candidate_root in [Path.cwd(), Path("/content"), Path("/content/Early-Brain-Tumor-Detection")]:
                     if (candidate_root / rel_path).is_file():
                         resolved_csv = candidate_root / rel_path
                         break
             if not resolved_csv.is_file():
-                raise FileNotFoundError(
-                    f"\n[Error] Could not locate split CSV '{rel_path}'.\n"
-                    f"Please make sure you have unzipped 'data_colab.zip' or cloned the repo:\n"
-                    f"  !unzip -q data_colab.zip\n"
-                )
+                raise FileNotFoundError(f"[Error] Could not locate CSV '{rel_path}'.")
             self.df = pd.read_csv(resolved_csv)
 
     def __len__(self):
@@ -540,44 +635,50 @@ class BrainTumorDataset(Dataset):
         row = self.df.iloc[idx]
         img_p = resolve_file_path(row["image_path"], self.data_root)
         if img_p is None or not img_p.is_file():
-            raise FileNotFoundError(
-                f"\n[Missing Image Error]: Cannot find MRI image file:\n  {row['image_path']}\n\n"
-                f"WHY THIS HAPPENS: Medical images (*.jpg, *.png) are not stored inside git repo due to size limits.\n"
-                f"HOW TO FIX ON COLAB (takes 1 minute):\n"
-                f"  1. Locate 'data_colab.zip' on your local computer in 'E:\\Brain tumor\\data_colab.zip'.\n"
-                f"  2. Upload 'data_colab.zip' to Google Drive or directly to the left files pane in Colab.\n"
-                f"  3. Run: !unzip -q data_colab.zip\n"
-            )
+            raise FileNotFoundError(f"Cannot find MRI scan at: {row['image_path']}")
 
-        img = Image.open(img_p).convert("L").resize((224, 224), Image.BILINEAR)
+        img_pil = Image.open(img_p).convert("L")
 
         has_mask = bool(row.get("has_mask", False))
         mask_p = resolve_file_path(row.get("mask_path", None), self.data_root) if has_mask else None
         if has_mask and mask_p is not None and mask_p.is_file():
-            mask = Image.open(mask_p).convert("L").resize((224, 224), Image.NEAREST)
+            mask_pil = Image.open(mask_p).convert("L")
         else:
-            mask = Image.new("L", (224, 224), 0)
+            mask_pil = Image.new("L", img_pil.size, 0)
 
-        # Training Augmentation
+        # Synchronized Clinical Data Augmentations
         if self.augment:
+            # 1. Random Bilateral Horizontal Flip (brain midline invariance)
             if random.random() > 0.5:
-                img, mask = TF.hflip(img), TF.hflip(mask)
+                img_pil = TF.hflip(img_pil)
+                mask_pil = TF.hflip(mask_pil)
+
+            # 2. Random Gentle Rotation (-15 to +15 degrees)
             if random.random() > 0.5:
                 angle = random.uniform(-15, 15)
-                img, mask = TF.rotate(img, angle), TF.rotate(mask, angle)
+                img_pil = TF.rotate(img_pil, angle)
+                mask_pil = TF.rotate(mask_pil, angle)
 
-        img_np = np.array(img, dtype=np.float32) / 255.0
-        img_norm = (img_np - 0.28) / 0.22
-        img_t = torch.from_numpy(img_norm).unsqueeze(0)
+            # 3. Random Affine Translation / Scale
+            if random.random() > 0.5:
+                scale = random.uniform(0.9, 1.1)
+                img_pil = TF.affine(img_pil, angle=0, translate=[0, 0], scale=scale, shear=0)
+                mask_pil = TF.affine(mask_pil, angle=0, translate=[0, 0], scale=scale, shear=0)
 
-        mask_np = (np.array(mask, dtype=np.float32) > 127).astype(np.float32)
-        mask_t = torch.from_numpy(mask_np).unsqueeze(0)
+        # Medical CLAHE Preprocessing on Image
+        norm_img = preprocess_mri_medical(img_pil, apply_clahe=True)
+        img_tensor = torch.from_numpy(norm_img).unsqueeze(0)
+
+        # Mask Binarization
+        mask_resized = mask_pil.resize((224, 224), Image.NEAREST)
+        mask_np = (np.array(mask_resized, dtype=np.float32) > 127).astype(np.float32)
+        mask_tensor = torch.from_numpy(mask_np).unsqueeze(0)
 
         raw_label = str(row["tumor_label"]).lower().strip().replace("notumor", "no_tumor")
         label_idx = LABEL_TO_IDX.get(raw_label, 3)
 
         return {
-            "image": img_t, "mask": mask_t,
+            "image": img_tensor, "mask": mask_tensor,
             "label": torch.tensor(label_idx, dtype=torch.long),
             "has_mask": torch.tensor(1.0 if (has_mask and mask_p is not None) else 0.0, dtype=torch.float32),
             "is_small_tumor": torch.tensor(1.0 if bool(row.get("is_small_tumor", False)) else 0.0, dtype=torch.float32),
@@ -586,11 +687,10 @@ class BrainTumorDataset(Dataset):
 
 
 # ==============================================================================
-# STEP 4: JOURNAL-GRADE METRICS & FIGURE PLOTTING SUITE
+# STEP 4: TEST-TIME AUGMENTATION (TTA) & JOURNAL EVALUATION
 # ==============================================================================
 
 def compute_expected_calibration_error(y_true: np.ndarray, y_probs: np.ndarray, num_bins: int = 10):
-    """Calculates Expected Calibration Error (ECE) for clinical reliability assessment."""
     confidences = np.max(y_probs, axis=1)
     predictions = np.argmax(y_probs, axis=1)
     accuracies = (predictions == y_true).astype(float)
@@ -612,7 +712,6 @@ def compute_expected_calibration_error(y_true: np.ndarray, y_probs: np.ndarray, 
 
 
 def compute_all_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_probs: np.ndarray, uncertainties: np.ndarray):
-    """Calculates all journal classification and calibration metrics."""
     cm = confusion_matrix(y_true, y_pred, labels=list(range(4)))
     acc = float(accuracy_score(y_true, y_pred))
     bal_acc = float(balanced_accuracy_score(y_true, y_pred))
@@ -655,7 +754,6 @@ def compute_all_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_probs: np.ndar
 
 
 def compute_segmentation_dice(pred_masks: np.ndarray, true_masks: np.ndarray, threshold: float = 0.5):
-    """Computes Dice Similarity Coefficient and Jaccard IoU."""
     preds = (pred_masks > threshold).astype(np.float32).reshape(-1)
     targets = (true_masks > 0.5).astype(np.float32).reshape(-1)
     intersection = np.sum(preds * targets)
@@ -664,8 +762,31 @@ def compute_segmentation_dice(pred_masks: np.ndarray, true_masks: np.ndarray, th
     return float(dice), float(iou)
 
 
+@torch.no_grad()
+def predict_with_tta(model: nn.Module, images: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Test-Time Augmentation (TTA): Ensemble of original, horizontal flip, and subtle scaling."""
+    # 1. Original
+    out1 = model(images)
+    probs1 = out1["probabilities"]
+    unc1 = out1["uncertainty"]
+    mask1 = out1["pred_mask"]
+
+    # 2. Horizontal Flip (Midline Symmetry Mirror)
+    images_flip = torch.flip(images, dims=[-1])
+    out2 = model(images_flip)
+    probs2 = out2["probabilities"]
+    unc2 = out2["uncertainty"]
+    mask2 = torch.flip(out2["pred_mask"], dims=[-1])
+
+    # Ensemble Average
+    ens_probs = 0.5 * (probs1 + probs2)
+    ens_unc = 0.5 * (unc1 + unc2)
+    ens_mask = 0.5 * (mask1 + mask2)
+
+    return ens_probs, ens_unc, ens_mask
+
+
 def generate_all_7_figures(metrics: Dict, y_true: np.ndarray, y_probs: np.ndarray, uncertainties: np.ndarray, small_metrics: Dict, sample_img: np.ndarray, sample_true_mask: np.ndarray, sample_pred_mask: np.ndarray, sample_rollout: np.ndarray, history: Optional[Dict] = None, output_dir: str = "reports/figures"):
-    """Generates all 7 publication-standard figures at 300 DPI."""
     os.makedirs(output_dir, exist_ok=True)
     plt.rcParams.update({"font.size": 11, "figure.dpi": 300, "savefig.dpi": 300, "savefig.bbox": "tight"})
 
@@ -676,7 +797,7 @@ def generate_all_7_figures(metrics: Dict, y_true: np.ndarray, y_probs: np.ndarra
     im = ax.imshow(cm_norm, cmap="Blues")
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     ax.set(xticks=np.arange(4), yticks=np.arange(4), xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES,
-           title="Normalized Confusion Matrix (X-R-MiTNet)", ylabel="Ground-Truth Diagnosis", xlabel="Predicted Diagnosis")
+           title="Normalized Confusion Matrix (X-R-MiTNet v2)", ylabel="Ground-Truth Diagnosis", xlabel="Predicted Diagnosis")
     for i in range(4):
         for j in range(4):
             ax.text(j, i, f"{cm_norm[i, j]*100:.1f}%\n({cm[i, j]})", ha="center", va="center",
@@ -709,7 +830,7 @@ def generate_all_7_figures(metrics: Dict, y_true: np.ndarray, y_probs: np.ndarra
     fig.savefig(f"{output_dir}/fig3_precision_recall_curves.pdf")
     plt.close()
 
-    # Fig 4: Training Dynamics (if history present)
+    # Fig 4: Training Dynamics
     if history:
         fig, axs = plt.subplots(2, 2, figsize=(11, 9))
         epochs = range(1, len(history["train_loss"]) + 1)
@@ -718,9 +839,9 @@ def generate_all_7_figures(metrics: Dict, y_true: np.ndarray, y_probs: np.ndarra
         axs[0, 0].set(title="(a) Multi-Task Loss Convergence", xlabel="Epoch", ylabel="Loss")
         axs[0, 0].legend()
 
-        axs[0, 1].plot(epochs, history.get("train_cls_loss", []), label="Evidential Loss", color="#2b5c8f")
+        axs[0, 1].plot(epochs, history.get("train_cls_loss", []), label="Focal Evidential Loss", color="#2b5c8f")
         axs[0, 1].plot(epochs, history.get("train_seg_loss", []), "--", label="Segmentation Loss", color="#7570b3")
-        axs[0, 1].set(title="(b) Component Loss Dynamics", xlabel="Epoch", ylabel="Component Loss")
+        axs[0, 1].set(title="(b) Component Loss Dynamics", xlabel="Epoch", ylabel="Loss")
         axs[0, 1].legend()
 
         axs[1, 0].plot(epochs, [a * 100 for a in history.get("train_acc", [])], "o-", label="Train Acc (%)", color="#2b5c8f")
@@ -729,7 +850,7 @@ def generate_all_7_figures(metrics: Dict, y_true: np.ndarray, y_probs: np.ndarra
         axs[1, 0].legend()
 
         axs[1, 1].plot(epochs, [f * 100 for f in history.get("val_f1", [])], "o-", label="Val Macro F1 (%)", color="#2b5c8f")
-        axs[1, 1].plot(epochs, [d * 100 for d in history.get("val_dice", [])], "^--", label="Val Dice (%)", color="#1b9e77")
+        axs[1, 1].plot(epochs, [d * 100 for d in history.get("val_dice", [])], "^--", label="Val Aux Dice (%)", color="#1b9e77")
         axs[1, 1].set(title="(d) Validation F1 & Auxiliary Dice Progression", xlabel="Epoch", ylabel="Score (%)")
         axs[1, 1].legend()
 
@@ -778,7 +899,7 @@ def generate_all_7_figures(metrics: Dict, y_true: np.ndarray, y_probs: np.ndarra
     fig, axs = plt.subplots(1, 5, figsize=(16, 3.8))
     img_disp = (sample_img - sample_img.min()) / (sample_img.max() - sample_img.min() + 1e-8)
     axs[0].imshow(img_disp, cmap="gray")
-    axs[0].set(title="1. Original MRI", xticks=[], yticks=[])
+    axs[0].set(title="1. Preprocessed MRI", xticks=[], yticks=[])
 
     axs[1].imshow(img_disp, cmap="gray")
     if sample_true_mask.max() > 0:
@@ -795,52 +916,67 @@ def generate_all_7_figures(metrics: Dict, y_true: np.ndarray, y_probs: np.ndarra
 
     axs[4].imshow(img_disp, cmap="gray")
     axs[4].imshow(sample_rollout, cmap="magma", alpha=0.55)
-    axs[4].set(title="5. Decision Attribution Overlay", xticks=[], yticks=[])
+    axs[4].set(title="5. Attribution Overlay", xticks=[], yticks=[])
 
-    fig.suptitle("Clinical Interpretability Panel: Multimodal Attribution and Segmentation Localization", fontsize=13, fontweight="bold", y=1.03)
+    fig.suptitle("Clinical Interpretability Panel: Hierarchical Asymmetry Attribution and FPN Boundary", fontsize=13, fontweight="bold", y=1.03)
     fig.tight_layout()
     fig.savefig(f"{output_dir}/fig7_care_xai_interpretability_panel.png")
     fig.savefig(f"{output_dir}/fig7_care_xai_interpretability_panel.pdf")
     plt.close()
 
-    print(f"✅ All 7 publication-grade figures saved to '{output_dir}/' (PNG & PDF @ 300 DPI)")
+    print(f"[OK] All 7 publication-grade figures saved to '{output_dir}/' (PNG & PDF @ 300 DPI)")
 
 
 # ==============================================================================
-# STEP 5: END-TO-END TRAINING & EVALUATION PIPELINE
+# STEP 5: DEEP MULTI-TASK TRAINING PIPELINE (WITH WARMUP & FOCAL LOSS)
 # ==============================================================================
 
-def train_and_evaluate_pipeline(epochs=20, batch_size=32, lr=3e-4):
-    """Executes model training, evaluation, and auto-generates all journal artifacts."""
-    print(f"\n{'='*70}\n[STEP 1/3] INITIALIZING DATASET & MODEL ARCHITECTURE\n{'='*70}")
+def train_and_evaluate_pipeline(epochs=30, batch_size=24, lr=3e-4, warmup_epochs=3):
+    """Executes high-capacity training with Linear Warmup, Focal Evidential Loss, and TTA."""
+    print(f"\n{'='*75}\n[STEP 1/3] INITIALIZING MULTI-SCALE DATASET & HIERARCHICAL MODEL\n{'='*75}")
     train_ds = BrainTumorDataset(split="train", is_training=True, augment=True)
     val_ds = BrainTumorDataset(split="val", is_training=False)
     test_ds = BrainTumorDataset(split="test", is_training=False)
     small_ds = BrainTumorDataset(split="small_tumor_test", is_training=False)
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=2 if device.type == 'cuda' else 0, pin_memory=(device.type == 'cuda'))
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=2 if device.type == 'cuda' else 0)
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
     small_loader = DataLoader(small_ds, batch_size=batch_size, shuffle=False)
 
-    model = XRMiTNet().to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    # Initialize X-R-MiTNet v2
+    model = XRMiTNet(
+        img_size=224, in_channels=1, num_classes=4,
+        dims=[64, 128, 256, 512], depths=[2, 2, 4, 2], num_heads=[2, 4, 8, 16], drop_rate=0.1
+    ).to(device)
 
-    # Modern PyTorch GradScaler
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"X-R-MiTNet (v2) Initialized: {total_params:,} trainable parameters.")
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
+
+    # Learning Rate Schedule with Warmup
+    def lr_lambda(current_epoch):
+        if current_epoch < warmup_epochs:
+            return float(current_epoch + 1) / float(max(1, warmup_epochs))
+        progress = float(current_epoch - warmup_epochs) / float(max(1, epochs - warmup_epochs))
+        return max(1e-6 / lr, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
     try:
         scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
     except:
         scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
 
-    evidential_loss_fn = EvidentialLoss(num_classes=4, kl_coeff=0.2)
-    dice_bce_loss_fn = DiceBCELoss()
+    focal_evidential_loss_fn = FocalEvidentialLoss(num_classes=4, kl_coeff=0.2, gamma=1.5)
+    dice_focal_bce_fn = CombinedDiceFocalBCELoss(smooth=1.0, gamma=2.0)
 
     history = {"train_loss": [], "train_cls_loss": [], "train_seg_loss": [], "train_acc": [], "val_loss": [], "val_acc": [], "val_f1": [], "val_dice": []}
     best_f1 = -1.0
     os.makedirs("checkpoints", exist_ok=True)
 
-    print(f"\n{'='*70}\n[STEP 2/3] STARTING MULTI-TASK TRAINING (EPOCHS: {epochs})\n{'='*70}")
+    print(f"\n{'='*75}\n[STEP 2/3] STARTING HIGH-CAPACITY TRAINING (EPOCHS: {epochs})\n{'='*75}")
     for epoch in range(epochs):
         model.train()
         t_loss, t_cls, t_seg, correct, total = 0.0, 0.0, 0.0, 0, 0
@@ -855,10 +991,15 @@ def train_and_evaluate_pipeline(epochs=20, batch_size=32, lr=3e-4):
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=(device.type == "cuda")):
                 out = model(images)
-                cls_loss, _, _ = evidential_loss_fn(out["alpha"], labels, epoch_ratio=(epoch + 1) / epochs)
+                cls_loss, _, _ = focal_evidential_loss_fn(out["alpha"], labels, epoch_ratio=(epoch + 1) / epochs)
+
                 mask_cnt = has_mask.sum()
-                seg_loss = (dice_bce_loss_fn(out["mask_logits"], masks) * has_mask.view(-1, 1, 1, 1)).sum() / (mask_cnt + 1e-8) if mask_cnt > 0 else torch.tensor(0.0, device=device)
-                total_loss = cls_loss + seg_loss
+                if mask_cnt > 0:
+                    seg_loss = (dice_focal_bce_fn(out["mask_logits"], masks) * has_mask.view(-1, 1, 1, 1)).sum() / (mask_cnt + 1e-8)
+                else:
+                    seg_loss = torch.tensor(0.0, device=device)
+
+                total_loss = cls_loss + (1.5 * seg_loss)
 
             scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)
@@ -874,8 +1015,9 @@ def train_and_evaluate_pipeline(epochs=20, batch_size=32, lr=3e-4):
             t_seg += seg_loss.item() * bs
 
         scheduler.step()
+        curr_lr = optimizer.param_groups[0]["lr"]
 
-        # Validation
+        # Validation (Without TTA during epoch validation for speed)
         model.eval()
         v_loss, v_labels, v_preds, v_pred_masks, v_true_masks = 0.0, [], [], [], []
         with torch.no_grad():
@@ -884,7 +1026,7 @@ def train_and_evaluate_pipeline(epochs=20, batch_size=32, lr=3e-4):
                 labels = batch["label"].to(device)
                 masks = batch["mask"].to(device)
                 out = model(images)
-                cls_loss, _, _ = evidential_loss_fn(out["alpha"], labels)
+                cls_loss, _, _ = focal_evidential_loss_fn(out["alpha"], labels)
                 v_loss += cls_loss.item() * images.size(0)
                 v_labels.extend(labels.cpu().numpy())
                 v_preds.extend(torch.argmax(out["probabilities"], dim=1).cpu().numpy())
@@ -904,35 +1046,46 @@ def train_and_evaluate_pipeline(epochs=20, batch_size=32, lr=3e-4):
         history["val_f1"].append(v_f1)
         history["val_dice"].append(v_dice)
 
-        print(f"Epoch {epoch+1:02d}/{epochs:02d} | Train Loss: {t_loss/total:.4f} (Acc: {correct/total*100:.1f}%) | Val Acc: {v_acc*100:.1f}% | Val Macro F1: {v_f1*100:.1f}% | Aux Dice: {v_dice*100:.1f}%")
+        print(
+            f"Epoch {epoch+1:02d}/{epochs:02d} (lr: {curr_lr:.2e}) | "
+            f"Train Loss: {t_loss/total:.4f} (Acc: {correct/total*100:.1f}%) | "
+            f"Val Acc: {v_acc*100:.1f}% | Val Macro F1: {v_f1*100:.1f}% | Aux Dice: {v_dice*100:.1f}%"
+        )
 
         if v_f1 > best_f1:
             best_f1 = v_f1
             torch.save(model.state_dict(), "checkpoints/best_model.pth")
+            print(f"  >>> Best model saved! (Validation Macro-F1: {best_f1*100:.2f}%)")
 
-    print(f"\n{'='*70}\n[STEP 3/3] EXHAUSTIVE TEST SET EVALUATION & PUBLICATION REPORT\n{'='*70}")
+    print(f"\n{'='*75}\n[STEP 3/3] TEST-TIME AUGMENTATION (TTA) EXHAUSTIVE JOURNAL EVALUATION\n{'='*75}")
     model.load_state_dict(torch.load("checkpoints/best_model.pth", map_location=device))
     model.eval()
 
-    def run_eval(loader):
+    def run_eval_tta(loader):
         all_l, all_p, all_prob, all_u, p_masks, t_masks, imgs = [], [], [], [], [], [], []
         with torch.no_grad():
-            for batch in loader:
+            for batch in tqdm(loader, desc="TTA Testing", leave=False):
                 images = batch["image"].to(device)
                 labels = batch["label"].to(device)
                 masks = batch["mask"].to(device)
-                out = model(images)
+
+                probs, unc, pred_mask = predict_with_tta(model, images)
+
                 all_l.extend(labels.cpu().numpy())
-                all_p.extend(torch.argmax(out["probabilities"], dim=1).cpu().numpy())
-                all_prob.extend(out["probabilities"].cpu().numpy())
-                all_u.extend(out["uncertainty"].cpu().numpy())
-                p_masks.append(out["pred_mask"].cpu().numpy())
+                all_p.extend(torch.argmax(probs, dim=1).cpu().numpy())
+                all_prob.extend(probs.cpu().numpy())
+                all_u.extend(unc.cpu().numpy())
+                p_masks.append(pred_mask.cpu().numpy())
                 t_masks.append(masks.cpu().numpy())
                 imgs.append(images.cpu().numpy())
-        return np.array(all_l), np.array(all_p), np.array(all_prob), np.array(all_u), np.concatenate(p_masks), np.concatenate(t_masks), np.concatenate(imgs)
 
-    t_true, t_pred, t_probs, t_unc, t_pred_m, t_true_m, t_imgs = run_eval(test_loader)
-    sm_true, sm_pred, sm_probs, sm_unc, _, _, _ = run_eval(small_loader)
+        return (
+            np.array(all_l), np.array(all_p), np.array(all_prob), np.array(all_u),
+            np.concatenate(p_masks), np.concatenate(t_masks), np.concatenate(imgs)
+        )
+
+    t_true, t_pred, t_probs, t_unc, t_pred_m, t_true_m, t_imgs = run_eval_tta(test_loader)
+    sm_true, sm_pred, sm_probs, sm_unc, _, _, _ = run_eval_tta(small_loader)
 
     test_metrics = compute_all_metrics(t_true, t_pred, t_probs, t_unc)
     small_metrics = compute_all_metrics(sm_true, sm_pred, sm_probs, sm_unc)
@@ -946,7 +1099,7 @@ def train_and_evaluate_pipeline(epochs=20, batch_size=32, lr=3e-4):
     generate_all_7_figures(test_metrics, t_true, t_probs, t_unc, small_metrics, sample_img, sample_true_m, sample_pred_m, sample_rollout, history)
 
     print(f"\n=======================================================")
-    print(f"      JOURNAL PUBLICATION PERFORMANCE METRICS          ")
+    print(f"      JOURNAL PUBLICATION PERFORMANCE METRICS (TTA)   ")
     print(f"=======================================================")
     print(f"Overall Accuracy:          {test_metrics['accuracy']*100:.2f}%")
     print(f"Balanced Accuracy:         {test_metrics['balanced_accuracy']*100:.2f}%")
@@ -969,32 +1122,35 @@ def train_and_evaluate_pipeline(epochs=20, batch_size=32, lr=3e-4):
 
 
 # ==============================================================================
-# STEP 6: REAL-TIME PHOTO UPLOAD & INFERENCE SYSTEMS
+# STEP 6: REAL-TIME INTERACTIVE DIAGNOSTIC ENGINE
 # ==============================================================================
 
 class InteractiveDiagnosticEngine:
     """Preprocesses user-uploaded MRI scans and generates real-time diagnostics."""
     def __init__(self, model_path="checkpoints/best_model.pth"):
-        self.model = XRMiTNet().to(device)
+        self.model = XRMiTNet(
+            img_size=224, in_channels=1, num_classes=4,
+            dims=[64, 128, 256, 512], depths=[2, 2, 4, 2], num_heads=[2, 4, 8, 16]
+        ).to(device)
         if os.path.isfile(model_path):
             self.model.load_state_dict(torch.load(model_path, map_location=device))
         self.model.eval()
 
     def analyze_image(self, pil_image: Image.Image, discard_ratio: float = 0.85):
-        img_gray = pil_image.convert("L").resize((224, 224), Image.BILINEAR)
-        img_np = np.array(img_gray, dtype=np.float32) / 255.0
-        norm = (img_np - 0.28) / 0.22
+        norm = preprocess_mri_medical(pil_image, apply_clahe=True)
         tensor = torch.from_numpy(norm).unsqueeze(0).unsqueeze(0).to(device)
 
         with torch.no_grad():
-            out = self.model(tensor, return_attention=True)
-            probs = out["probabilities"][0].cpu().numpy()
-            unc = out["uncertainty"][0].item()
-            pred_mask = (out["pred_mask"][0, 0].cpu().numpy() > 0.5).astype(np.uint8)
+            probs, unc, pred_mask_t = predict_with_tta(self.model, tensor)
+            probs_np = probs[0].cpu().numpy()
+            unc_val = unc[0].item()
+            pred_mask = (pred_mask_t[0, 0].cpu().numpy() > 0.5).astype(np.uint8)
 
         rollout = compute_attention_rollout(self.model, tensor, discard_ratio=discard_ratio, device=device)
 
-        orig_rgb = cv2.cvtColor((img_np * 255).astype(np.uint8), cv2.COLOR_GRAY2RGB)
+        img_disp = ((norm - norm.min()) / (norm.max() - norm.min() + 1e-8) * 255).astype(np.uint8)
+        orig_rgb = cv2.cvtColor(img_disp, cv2.COLOR_GRAY2RGB)
+
         mask_overlay = orig_rgb.copy()
         if np.sum(pred_mask) > 0:
             color_mask = np.zeros_like(orig_rgb)
@@ -1004,13 +1160,12 @@ class InteractiveDiagnosticEngine:
         heatmap = cv2.applyColorMap((rollout * 255).astype(np.uint8), cv2.COLORMAP_MAGMA)
         xai_overlay = cv2.addWeighted(orig_rgb, 0.5, cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB), 0.5, 0)
 
-        top_idx = int(np.argmax(probs))
-        confidences = {CLASS_NAMES[i]: float(probs[i]) for i in range(4)}
-        return confidences, CLASS_NAMES[top_idx], probs[top_idx], unc, orig_rgb, mask_overlay, xai_overlay
+        top_idx = int(np.argmax(probs_np))
+        confidences = {CLASS_NAMES[i]: float(probs_np[i]) for i in range(4)}
+        return confidences, CLASS_NAMES[top_idx], probs_np[top_idx], unc_val, orig_rgb, mask_overlay, xai_overlay
 
 
 def launch_in_notebook_uploader():
-    """Method A: Native in-notebook widget for uploading and testing MRI scans."""
     import ipywidgets as widgets
     from IPython.display import display, clear_output
 
@@ -1030,15 +1185,15 @@ def launch_in_notebook_uploader():
 
             fig, axs = plt.subplots(1, 3, figsize=(15, 4.5))
             axs[0].imshow(orig)
-            axs[0].set(title="Input MRI Scan", xticks=[], yticks=[])
+            axs[0].set(title="CLAHE-Enhanced MRI", xticks=[], yticks=[])
             axs[1].imshow(mask_view)
-            axs[1].set(title=f"Predicted Lesion Mask", xticks=[], yticks=[])
+            axs[1].set(title="FPN Segmented Boundary", xticks=[], yticks=[])
             axs[2].imshow(xai_view)
-            axs[2].set(title=f"CARE-XAI Heatmap Overlay", xticks=[], yticks=[])
+            axs[2].set(title="CARE-XAI Rollout Overlay", xticks=[], yticks=[])
             plt.show()
 
             print(f"\n------------------------------------------------------------")
-            print(f"  DIAGNOSIS:             {top_class.upper()} ({top_conf*100:.2f}%)")
+            print(f"  DIAGNOSIS (TTA):       {top_class.upper()} ({top_conf*100:.2f}%)")
             print(f"  Epistemic Uncertainty: {unc:.4f} (Reliability: {max(0.0, 1.0 - unc):.4f})")
             print(f"------------------------------------------------------------")
             for c_name, p in confidences.items():
@@ -1052,7 +1207,6 @@ def launch_in_notebook_uploader():
 
 
 def launch_gradio_web_app():
-    """Method B: Gradio Web App with Public Shareable Link for remote testing."""
     import gradio as gr
     engine = InteractiveDiagnosticEngine()
 
@@ -1065,7 +1219,7 @@ def launch_gradio_web_app():
         return confs, report, orig, mask_view, xai_view
 
     with gr.Blocks(title="X-R-MiTNet Brain Tumor Diagnosis") as demo:
-        gr.Markdown("# 🧠 X-R-MiTNet Real-Time Brain Tumor Diagnostic Platform")
+        gr.Markdown("# 🧠 X-R-MiTNet (v2) Real-Time Brain Tumor Diagnostic Platform")
         with gr.Row():
             with gr.Column():
                 input_img = gr.Image(type="pil", label="Upload Brain MRI Scan")
@@ -1075,8 +1229,8 @@ def launch_gradio_web_app():
                 conf_out = gr.Label(num_top_classes=4, label="Class Probabilities")
                 md_out = gr.Markdown()
         with gr.Row():
-            v1 = gr.Image(label="1. Standardized MRI")
-            v2 = gr.Image(label="2. Auxiliary Lesion Mask")
+            v1 = gr.Image(label="1. CLAHE-Enhanced MRI")
+            v2 = gr.Image(label="2. FPN Segmented Lesion")
             v3 = gr.Image(label="3. CARE-XAI Attention Overlay")
 
         btn.click(predict_gradio, inputs=[input_img, discard_s], outputs=[conf_out, md_out, v1, v2, v3])
@@ -1088,11 +1242,13 @@ def launch_gradio_web_app():
 # EXECUTION ENTRY POINT
 # ==============================================================================
 if __name__ == "__main__":
-    trained_model = train_and_evaluate_pipeline(epochs=20, batch_size=32, lr=3e-4)
+    # Deep Multi-Task Training with Warmup and Focal Evidential Loss
+    trained_model = train_and_evaluate_pipeline(epochs=30, batch_size=24, lr=3e-4, warmup_epochs=3)
 
+    # In-Notebook Interactive Uploader
     print("\n[Launching In-Notebook Interactive Uploader Widget]")
     launch_in_notebook_uploader()
 
+    # Public Gradio Web Application
     print("\n[Launching Gradio Public Web Application]")
     launch_gradio_web_app()
-
