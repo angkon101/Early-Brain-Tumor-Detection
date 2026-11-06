@@ -95,10 +95,11 @@ def auto_prepare_data():
         return False
 
     for cand_dir in [
+        "data",
         "data/01_primary_multitask",
         "01_primary_multitask",
-        "/content/data/01_primary_multitask",
-        "/content/Early-Brain-Tumor-Detection/data/01_primary_multitask",
+        "/content/data",
+        "/content/Early-Brain-Tumor-Detection/data",
     ]:
         if has_images(cand_dir):
             print(f"[OK] Verified: Real MRI scans & masks present in '{cand_dir}'.")
@@ -117,7 +118,10 @@ def auto_prepare_data():
     for s_dir in search_dirs:
         if s_dir.is_dir():
             for zf in s_dir.glob("*.zip"):
-                zip_candidates.append(zf)
+                if zipfile.is_zipfile(zf):
+                    zip_candidates.append(zf)
+                else:
+                    print(f"[*] Skipping invalid/corrupted zip: {zf.name} ({zf.stat().st_size} bytes)")
 
     target_zip = None
     for zf in zip_candidates:
@@ -130,12 +134,15 @@ def auto_prepare_data():
         target_zip = zip_candidates[0]
 
     if target_zip is not None and target_zip.is_file():
-        print(f"[ZIP] Found uploaded dataset archive at: '{target_zip}'")
-        print(f"      Unzipping files into '{Path.cwd().resolve()}' (takes ~15 seconds)...")
-        with zipfile.ZipFile(target_zip, "r") as z:
-            z.extractall(Path.cwd())
-        print("[OK] Extraction complete! All MRI images & masks are now available.")
-        return
+        try:
+            print(f"[ZIP] Found valid uploaded dataset archive at: '{target_zip}'")
+            print(f"      Unzipping files into '{Path.cwd().resolve()}' (takes ~15 seconds)...")
+            with zipfile.ZipFile(target_zip, "r") as z:
+                z.extractall(Path.cwd())
+            print("[OK] Extraction complete! All MRI images & masks are now available.")
+            return
+        except Exception as e:
+            print(f"[Warning] Could not extract '{target_zip}': {e}")
 
     print("[!] Could not locate zip archive automatically. In Colab run: !unzip -q /content/*.zip")
 
