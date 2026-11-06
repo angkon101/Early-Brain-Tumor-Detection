@@ -1532,6 +1532,54 @@ def train_and_evaluate_pipeline(epochs=30, batch_size=24, lr=3e-4, warmup_epochs
     print(f"Small-Tumour Macro F1:     {small_metrics['macro_f1']*100:.2f}%")
     print(f"=======================================================\n")
 
+    # Export Publication-Grade LaTeX Table
+    latex_table = f"""% Auto-generated IEEE/Nature Journal LaTeX Table
+\\begin{{table}}[htbp]
+\\centering
+\\caption{{Quantitative Multi-Task Evaluation of X-R-MiTNet (v2) on Brain Tumor Detection & Auxiliary Segmentation}}
+\\label{{tab:tumor_results}}
+\\begin{{tabular}}{{lc|lc}}
+\\hline
+\\textbf{{Metric}} & \\textbf{{Score}} & \\textbf{{Metric}} & \\textbf{{Score}} \\\\
+\\hline
+Accuracy & {test_metrics['accuracy']*100:.2f}\\% & Balanced Accuracy & {test_metrics['balanced_accuracy']*100:.2f}\\% \\\\
+Macro F1-Score & {test_metrics['macro_f1']*100:.2f}\\% & Weighted F1-Score & {test_metrics['weighted_f1']*100:.2f}\\% \\\\
+Macro Specificity & {test_metrics['macro_specificity']*100:.2f}\\% & Macro Precision & {test_metrics['macro_precision']*100:.2f}\\% \\\\
+Macro Sensitivity (Recall) & {test_metrics['macro_recall']*100:.2f}\\% & AUC-ROC (OvR) & {test_metrics['auc_roc']:.4f} \\\\
+Cohen's Kappa ($\\kappa$) & {test_metrics['cohen_kappa']:.4f} & Matthews Corr (MCC) & {test_metrics['matthews_corrcoef']:.4f} \\\\
+Expected Calib Error (ECE) & {test_metrics['expected_calibration_error']:.4f} & Small-Tumor Recall & {small_metrics['macro_recall']*100:.2f}\\% \\\\
+Auxiliary Dice Score & {dice_score*100:.2f}\\% & Auxiliary IoU (Jaccard) & {iou_score*100:.2f}\\% \\\\
+\\hline
+\\end{{tabular}}
+\\end{{table}}
+"""
+    os.makedirs("reports/metrics", exist_ok=True)
+    with open("reports/metrics/latex_table.tex", "w") as f:
+        f.write(latex_table)
+    print("--- Auto-Generated Journal LaTeX Table (Ready for Overleaf) ---")
+    print(latex_table)
+
+    # Display Generated Publication Figures Inline in Colab
+    try:
+        from IPython.display import Image as IPImage, display as ipy_display
+        print("\n[Displaying Generated Publication Figures Inline @ 300 DPI]")
+        figure_list = [
+            ("Radiological Class Feature Distributions Across All Folders", "reports/figures/class_feature_profiles.png"),
+            ("Figure 1: Normalized Confusion Matrix", "reports/figures/fig1_confusion_matrix.png"),
+            ("Figure 2: Multi-Class One-vs-Rest ROC Curves", "reports/figures/fig2_multiclass_roc.png"),
+            ("Figure 3: Multi-Class Precision-Recall Curves", "reports/figures/fig3_precision_recall_curves.png"),
+            ("Figure 4: Training Dynamics & Multi-Task Convergence", "reports/figures/fig4_training_dynamics.png"),
+            ("Figure 5: Reliability Diagram & Epistemic Uncertainty Separation", "reports/figures/fig5_reliability_and_calibration.png"),
+            ("Figure 6: Early/Small-Tumour Subgroup Comparative Analysis", "reports/figures/fig6_small_tumor_comparison.png"),
+            ("Figure 7: CARE-XAI Multi-Panel Clinical Interpretability", "reports/figures/fig7_care_xai_interpretability_panel.png"),
+        ]
+        for fig_title, fig_path in figure_list:
+            if os.path.isfile(fig_path):
+                print(f"\n{'='*70}\n{fig_title}\n{'='*70}")
+                ipy_display(IPImage(filename=fig_path, width=700))
+    except Exception as e:
+        print(f"Inline display skipped: {e}")
+
     return model
 
 
