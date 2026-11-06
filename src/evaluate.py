@@ -129,12 +129,11 @@ def run_full_journal_evaluation(
     # 1. Load Model
     model = XRMiTNet(
         img_size=224,
-        patch_size=16,
         in_channels=1,
         num_classes=4,
-        embed_dim=256,
-        depth=6,
-        num_heads=8,
+        dims=[64, 128, 256, 512],
+        depths=[2, 2, 4, 2],
+        num_heads=[2, 4, 8, 16],
     ).to(target_device)
 
     chk_file = Path(model_checkpoint)

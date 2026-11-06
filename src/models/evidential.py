@@ -112,3 +112,8 @@ class EvidentialLoss(nn.Module):
         total_loss = focal_ace_loss + annealed_kl
 
         return total_loss, focal_ace_loss, kl
+
+
+# Alias for backwards compatibility and explicit naming
+FocalEvidentialLoss = EvidentialLoss
+

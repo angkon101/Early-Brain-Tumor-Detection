@@ -39,12 +39,11 @@ class TumorDiagnosticEngine:
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.model = XRMiTNet(
             img_size=224,
-            patch_size=16,
             in_channels=1,
             num_classes=4,
-            embed_dim=256,
-            depth=6,
-            num_heads=8,
+            dims=[64, 128, 256, 512],
+            depths=[2, 2, 4, 2],
+            num_heads=[2, 4, 8, 16],
         ).to(self.device)
 
         if checkpoint_path and Path(checkpoint_path).is_file():

@@ -24,12 +24,11 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.data.dataset import BrainTumorDataset
-from src.models.evidential import EvidentialLoss
+from src.models.evidential import EvidentialLoss, FocalEvidentialLoss
 from src.models.segmentation_head import DiceBCELoss
 from src.models.x_r_mitnet import XRMiTNet
 from src.utils.metrics import compute_comprehensive_classification_metrics, compute_segmentation_metrics
@@ -50,8 +49,8 @@ def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
-    scaler: GradScaler,
-    evidential_loss_fn: EvidentialLoss,
+    scaler: torch.amp.GradScaler,
+    evidential_loss_fn: nn.Module,
     dice_bce_loss_fn: DiceBCELoss,
     device: torch.device,
     epoch: int,
@@ -80,7 +79,8 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
-        with autocast(enabled=use_amp and device.type == "cuda"):
+        amp_device = "cuda" if device.type == "cuda" else "cpu"
+        with torch.amp.autocast(amp_device, enabled=use_amp and device.type == "cuda"):
             outputs = model(images)
             alpha = outputs["alpha"]
             mask_logits = outputs["mask_logits"]
@@ -283,13 +283,11 @@ def train_model(
     # 2. Instantiate Model
     model = XRMiTNet(
         img_size=224,
-        patch_size=16,
         in_channels=1,
         num_classes=4,
-        embed_dim=256,
-        depth=6,
-        num_heads=8,
-        mlp_ratio=4.0,
+        dims=[64, 128, 256, 512],
+        depths=[2, 2, 4, 2],
+        num_heads=[2, 4, 8, 16],
         drop_rate=0.1,
     ).to(target_device)
 
@@ -297,12 +295,13 @@ def train_model(
     print(f"X-R-MiTNet Initialized: {num_params:,} trainable parameters.")
 
     # 3. Losses, Optimizer, Scheduler, Scaler
-    evidential_loss_fn = EvidentialLoss(num_classes=4, kl_coeff=kl_coeff)
+    evidential_loss_fn = FocalEvidentialLoss(num_classes=4, kl_coeff=kl_coeff, gamma=2.0)
     dice_bce_loss_fn = DiceBCELoss(smooth=1.0, bce_weight=0.5)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
-    scaler = GradScaler(enabled=(target_device.type == "cuda"))
+    amp_dev = "cuda" if target_device.type == "cuda" else "cpu"
+    scaler = torch.amp.GradScaler(amp_dev, enabled=(target_device.type == "cuda"))
 
     # 4. Training Loop
     history: Dict[str, List[float]] = {
