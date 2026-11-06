@@ -276,3 +276,4 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         batch_size=args.batch_size,
     )
+
