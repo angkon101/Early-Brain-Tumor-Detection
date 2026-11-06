@@ -132,15 +132,16 @@ def auto_prepare_data():
 
     if target_zip is not None and target_zip.is_file():
         print(f"[ZIP] Found uploaded dataset archive at: '{target_zip}' ({target_zip.stat().st_size / 1e6:.1f} MB)")
-        print(f"      Unzipping files into '{Path.cwd().resolve()}'...")
+        target_dest = Path("/content/Early-Brain-Tumor-Detection") if Path("/content/Early-Brain-Tumor-Detection").is_dir() else Path.cwd()
+        print(f"      Unzipping files into '{target_dest.resolve()}'...")
         extracted = False
         try:
             with zipfile.ZipFile(target_zip, "r") as z:
-                z.extractall(Path.cwd())
+                z.extractall(target_dest)
             extracted = True
         except Exception as e:
             # Fallback to linux command unzip if python zipfile hits central dir issues
-            ret = os.system(f"unzip -o -q '{target_zip}' -d '{Path.cwd()}'")
+            ret = os.system(f"unzip -o -q '{target_zip}' -d '{target_dest}'")
             if ret == 0:
                 extracted = True
 
@@ -566,8 +567,11 @@ def preprocess_mri_medical(image: Image.Image, apply_clahe: bool = True) -> np.n
     return norm
 
 
+_FILE_INDEX: Dict[str, Path] = {}
+
 def resolve_file_path(path_str: Optional[Union[str, Path]], data_root: Optional[Union[str, Path]] = None) -> Optional[Path]:
     """Dynamically resolves dataset file paths across Windows, Linux, and Google Colab."""
+    global _FILE_INDEX
     if path_str is None or pd.isna(path_str):
         return None
     s = str(path_str).strip()
@@ -580,6 +584,9 @@ def resolve_file_path(path_str: Optional[Union[str, Path]], data_root: Optional[
 
     norm_s = s.replace("\\", "/")
     fname = direct_p.name
+
+    if fname in _FILE_INDEX and _FILE_INDEX[fname].is_file():
+        return _FILE_INDEX[fname]
 
     candidates = []
     if "data/" in norm_s:
@@ -602,6 +609,7 @@ def resolve_file_path(path_str: Optional[Union[str, Path]], data_root: Optional[
         for cand in candidates:
             target = base / cand
             if target.is_file():
+                _FILE_INDEX[fname] = target
                 return target
 
     for base in search_bases:
@@ -610,10 +618,26 @@ def resolve_file_path(path_str: Optional[Union[str, Path]], data_root: Optional[
             "01_primary_multitask/segmentation/Train/masks", "01_primary_multitask/segmentation/Test/masks",
             "data/01_primary_multitask/segmentation/Train/images", "data/01_primary_multitask/segmentation/Test/images",
             "data/01_primary_multitask/segmentation/Train/masks", "data/01_primary_multitask/segmentation/Test/masks",
+            "data/01_primary_multitask/classification/Train/glioma", "data/01_primary_multitask/classification/Train/meningioma",
+            "data/01_primary_multitask/classification/Train/pituitary", "data/01_primary_multitask/classification/Train/no_tumor",
+            "data/01_primary_multitask/classification/Test/glioma", "data/01_primary_multitask/classification/Test/meningioma",
+            "data/01_primary_multitask/classification/Test/pituitary", "data/01_primary_multitask/classification/Test/no_tumor",
         ]:
             target = base / sub / fname
             if target.is_file():
+                _FILE_INDEX[fname] = target
                 return target
+
+    if not _FILE_INDEX:
+        for base in search_bases:
+            if base.is_dir():
+                for ext in ("*.jpg", "*.jpeg", "*.png"):
+                    for f in base.rglob(ext):
+                        if f.name not in _FILE_INDEX:
+                            _FILE_INDEX[f.name] = f
+        if fname in _FILE_INDEX:
+            return _FILE_INDEX[fname]
+
     return None
 
 
@@ -1833,13 +1857,37 @@ def launch_gradio_web_app():
 # EXECUTION ENTRY POINT
 # ==============================================================================
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Train X-R-MiTNet (v2) on Colab/Local")
+    parser.add_argument("--epochs", type=int, default=30, help="Number of epochs to train (default: 30)")
+    parser.add_argument("--batch_size", type=int, default=24, help="Batch size for training (default: 24)")
+    parser.add_argument("--lr", type=float, default=3e-4, help="Initial learning rate (default: 3e-4)")
+    parser.add_argument("--warmup_epochs", type=int, default=3, help="Number of warmup epochs (default: 3)")
+    parser.add_argument("--dataset_mode", type=str, default="universal", help="Dataset mode: universal or standard")
+    parser.add_argument("--data_dir", type=str, default="data", help="Directory where dataset images are located")
+    parser.add_argument("--no_gradio", action="store_true", help="Skip launching Gradio web app")
+    args, unknown = parser.parse_known_args()
+
     # Deep Multi-Task Training with Warmup and Focal Evidential Loss across all subfolders
-    trained_model = train_and_evaluate_pipeline(epochs=30, batch_size=24, lr=3e-4, warmup_epochs=3, dataset_mode="universal")
+    trained_model = train_and_evaluate_pipeline(
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        warmup_epochs=args.warmup_epochs,
+        dataset_mode=args.dataset_mode
+    )
 
     # In-Notebook Interactive Uploader
     print("\n[Launching In-Notebook Interactive Uploader Widget]")
-    launch_in_notebook_uploader()
+    try:
+        launch_in_notebook_uploader()
+    except Exception as e:
+        print(f"Uploader widget skipped: {e}")
 
     # Public Gradio Web Application
-    print("\n[Launching Gradio Public Web Application]")
-    launch_gradio_web_app()
+    if not args.no_gradio:
+        print("\n[Launching Gradio Public Web Application]")
+        try:
+            launch_gradio_web_app()
+        except Exception as e:
+            print(f"Gradio app skipped: {e}")
