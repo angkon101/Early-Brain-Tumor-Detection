@@ -295,3 +295,114 @@ class BrainTumorDataset(Dataset):
             "cohort": str(row.get("cohort", "unknown")),
             "case_id": str(row.get("case_id", row.get("filename", f"idx_{idx}"))),
         }
+
+
+def crawl_all_folders(data_dir: Union[str, Path] = "data") -> pd.DataFrame:
+    """Recursively walks every folder in data_dir to discover all MRI scans,
+    matches labels from directory names or filename tokens, and pairs masks when present.
+    """
+    data_path = Path(data_dir)
+    class_aliases = {
+        "notumor": "no_tumor", "no_tumor": "no_tumor", "normal": "no_tumor", "healthy": "no_tumor",
+        "glioma": "glioma", "gl": "glioma",
+        "meningioma": "meningioma", "me": "meningioma",
+        "pituitary": "pituitary", "pi": "pituitary",
+    }
+
+    all_images = []
+    for ext in ["*.jpg", "*.jpeg", "*.png"]:
+        for p in data_path.rglob(ext):
+            parts_lower = [part.lower() for part in p.parts]
+            if "mask" in p.name.lower() or "masks" in parts_lower:
+                continue
+            all_images.append(p)
+
+    records = []
+    for p in all_images:
+        parts_lower = [part.lower() for part in p.parts]
+        stem_lower = p.stem.lower()
+
+        matched_label = None
+        for alias, cls_name in class_aliases.items():
+            if alias in parts_lower or f"_{alias}_" in stem_lower or stem_lower.startswith(f"{alias}_"):
+                matched_label = cls_name
+                break
+
+        if matched_label is None:
+            continue
+
+        # Check if mask exists in adjacent 'masks' directory
+        mask_path = None
+        has_mask = False
+        if "images" in parts_lower:
+            mask_candidate = p.parent.parent / "masks" / f"{p.stem}.png"
+            if mask_candidate.is_file():
+                mask_path = str(mask_candidate)
+                has_mask = True
+
+        records.append({
+            "case_id": p.stem,
+            "filename": p.name,
+            "image_path": str(p),
+            "mask_path": mask_path if mask_path else "",
+            "has_mask": has_mask,
+            "tumor_label": matched_label,
+            "is_small_tumor": False,
+            "tumor_pixel_area": 0.0,
+            "cohort": parts_lower[1] if len(parts_lower) > 1 else "universal",
+        })
+
+    df = pd.DataFrame(records)
+    return df
+
+
+class UniversalBrainTumorDataset(BrainTumorDataset):
+    """Universal Dataset Walker that crawls every folder of the dataset,
+    learns from every available image, and partitions into stratified train/val/test splits.
+    """
+
+    def __init__(
+        self,
+        data_dir: Union[str, Path] = "data",
+        split: str = "train",
+        split_ratios: Tuple[float, float, float] = (0.70, 0.15, 0.15),
+        seed: int = 42,
+        image_size: Tuple[int, int] = (224, 224),
+        is_training: bool = False,
+        augment: bool = False,
+    ):
+        self.image_size = image_size
+        self.transform = None
+        self.is_training = is_training
+        self.augment = augment and is_training
+        self.data_root = Path(data_dir)
+
+        cache_csv = Path(data_dir) / f"universal_split_{split}.csv"
+        if cache_csv.is_file():
+            self.df = pd.read_csv(cache_csv)
+        else:
+            full_df = crawl_all_folders(data_dir)
+            if len(full_df) == 0:
+                raise FileNotFoundError(f"No MRI images found in '{data_dir}' across any folders.")
+
+            # Stratified split by class
+            from sklearn.model_selection import train_test_split
+            train_val_df, test_df = train_test_split(
+                full_df, test_size=split_ratios[2], random_state=seed, stratify=full_df["tumor_label"]
+            )
+            val_relative_size = split_ratios[1] / (split_ratios[0] + split_ratios[1])
+            train_df, val_df = train_test_split(
+                train_val_df, test_size=val_relative_size, random_state=seed, stratify=train_val_df["tumor_label"]
+            )
+
+            # Cache splits
+            try:
+                train_df.to_csv(Path(data_dir) / "universal_split_train.csv", index=False)
+                val_df.to_csv(Path(data_dir) / "universal_split_val.csv", index=False)
+                test_df.to_csv(Path(data_dir) / "universal_split_test.csv", index=False)
+            except Exception:
+                pass
+
+            split_map = {"train": train_df, "val": val_df, "test": test_df}
+            self.df = split_map.get(split, train_df).reset_index(drop=True)
+
