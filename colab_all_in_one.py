@@ -20,6 +20,7 @@ import time
 import json
 import zipfile
 import random
+import functools
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -90,19 +91,18 @@ def auto_prepare_data():
             return False
         for root, dirs, files in os.walk(p):
             for f in files:
-                if f.lower().endswith(('.jpg', '.jpeg', '.png')) and "mask" not in f.lower():
+                if f.lower().endswith(('.jpg', '.jpeg', '.png')):
                     return True
         return False
 
     for cand_dir in [
-        "data",
         "data/01_primary_multitask",
         "01_primary_multitask",
-        "/content/data",
-        "/content/Early-Brain-Tumor-Detection/data",
+        "/content/data/01_primary_multitask",
+        "/content/Early-Brain-Tumor-Detection/data/01_primary_multitask",
     ]:
         if has_images(cand_dir):
-            print(f"[OK] Verified: Real MRI scans present in '{cand_dir}'.")
+            print(f"[OK] Verified: Real MRI scans & masks present in '{cand_dir}'.")
             return
 
     print("[*] MRI images not yet extracted. Scanning for uploaded .zip files...")
@@ -131,25 +131,12 @@ def auto_prepare_data():
         target_zip = zip_candidates[0]
 
     if target_zip is not None and target_zip.is_file():
-        print(f"[ZIP] Found uploaded dataset archive at: '{target_zip}' ({target_zip.stat().st_size / 1e6:.1f} MB)")
-        target_dest = Path("/content/Early-Brain-Tumor-Detection") if Path("/content/Early-Brain-Tumor-Detection").is_dir() else Path.cwd()
-        print(f"      Unzipping files into '{target_dest.resolve()}'...")
-        extracted = False
-        try:
-            with zipfile.ZipFile(target_zip, "r") as z:
-                z.extractall(target_dest)
-            extracted = True
-        except Exception as e:
-            # Fallback to linux command unzip if python zipfile hits central dir issues
-            ret = os.system(f"unzip -o -q '{target_zip}' -d '{target_dest}'")
-            if ret == 0:
-                extracted = True
-
-        if extracted:
-            print("[OK] Extraction complete! All MRI images & masks are now available.")
-            return
-
-    print("[!] Could not auto-extract zip archive. Run: !unzip -o -q /content/*.zip -d /content/Early-Brain-Tumor-Detection/")
+        print(f"[ZIP] Found uploaded dataset archive at: '{target_zip}'")
+        print(f"      Unzipping files into '{Path.cwd().resolve()}' (takes ~15 seconds)...")
+        with zipfile.ZipFile(target_zip, "r") as z:
+            z.extractall(Path.cwd())
+        print("[OK] Extraction complete! All MRI images & masks are now available.")
+        return
 
     print("[!] Could not locate zip archive automatically. In Colab run: !unzip -q /content/*.zip")
 
@@ -567,11 +554,9 @@ def preprocess_mri_medical(image: Image.Image, apply_clahe: bool = True) -> np.n
     return norm
 
 
-_FILE_INDEX: Dict[str, Path] = {}
-
+@functools.lru_cache(maxsize=32768)
 def resolve_file_path(path_str: Optional[Union[str, Path]], data_root: Optional[Union[str, Path]] = None) -> Optional[Path]:
     """Dynamically resolves dataset file paths across Windows, Linux, and Google Colab."""
-    global _FILE_INDEX
     if path_str is None or pd.isna(path_str):
         return None
     s = str(path_str).strip()
@@ -584,9 +569,6 @@ def resolve_file_path(path_str: Optional[Union[str, Path]], data_root: Optional[
 
     norm_s = s.replace("\\", "/")
     fname = direct_p.name
-
-    if fname in _FILE_INDEX and _FILE_INDEX[fname].is_file():
-        return _FILE_INDEX[fname]
 
     candidates = []
     if "data/" in norm_s:
@@ -609,7 +591,6 @@ def resolve_file_path(path_str: Optional[Union[str, Path]], data_root: Optional[
         for cand in candidates:
             target = base / cand
             if target.is_file():
-                _FILE_INDEX[fname] = target
                 return target
 
     for base in search_bases:
@@ -618,26 +599,10 @@ def resolve_file_path(path_str: Optional[Union[str, Path]], data_root: Optional[
             "01_primary_multitask/segmentation/Train/masks", "01_primary_multitask/segmentation/Test/masks",
             "data/01_primary_multitask/segmentation/Train/images", "data/01_primary_multitask/segmentation/Test/images",
             "data/01_primary_multitask/segmentation/Train/masks", "data/01_primary_multitask/segmentation/Test/masks",
-            "data/01_primary_multitask/classification/Train/glioma", "data/01_primary_multitask/classification/Train/meningioma",
-            "data/01_primary_multitask/classification/Train/pituitary", "data/01_primary_multitask/classification/Train/no_tumor",
-            "data/01_primary_multitask/classification/Test/glioma", "data/01_primary_multitask/classification/Test/meningioma",
-            "data/01_primary_multitask/classification/Test/pituitary", "data/01_primary_multitask/classification/Test/no_tumor",
         ]:
             target = base / sub / fname
             if target.is_file():
-                _FILE_INDEX[fname] = target
                 return target
-
-    if not _FILE_INDEX:
-        for base in search_bases:
-            if base.is_dir():
-                for ext in ("*.jpg", "*.jpeg", "*.png"):
-                    for f in base.rglob(ext):
-                        if f.name not in _FILE_INDEX:
-                            _FILE_INDEX[f.name] = f
-        if fname in _FILE_INDEX:
-            return _FILE_INDEX[fname]
-
     return None
 
 
@@ -706,36 +671,24 @@ def analyze_image_features(image_path: Path) -> Dict[str, float]:
 
 def scan_all_dataset_folders(data_dir: Union[str, Path] = "data", max_samples_per_folder: int = 100) -> Tuple[Dict[str, Dict], Dict[str, List[Dict]]]:
     """Recursively walks every folder in data_dir, identifies classes, and learns feature distributions."""
-    candidates = [
-        Path(data_dir),
-        Path.cwd() / "data",
-        Path("/content/data"),
-        Path("/content/Early-Brain-Tumor-Detection/data"),
-        Path.cwd()
-    ]
-
-    all_images = []
-    chosen_path = Path(data_dir)
-    for cand in candidates:
-        if cand.is_dir():
-            imgs = [
-                p for ext in ["*.jpg", "*.jpeg", "*.png"]
-                for p in cand.rglob(ext)
-                if "mask" not in p.name.lower() and "masks" not in [x.lower() for x in p.parts]
-            ]
-            if len(imgs) > len(all_images):
-                all_images = imgs
-                chosen_path = cand
-
-    print(f"\n{'='*75}\nRECURSIVE DATASET FOLDER SCANNER & FEATURE LEARNING ENGINE\nScanning directory: {chosen_path.resolve()}\n{'='*75}")
+    data_path = Path(data_dir)
+    print(f"\n{'='*75}\nRECURSIVE DATASET FOLDER SCANNER & FEATURE LEARNING ENGINE\nScanning directory: {data_path.resolve()}\n{'='*75}")
 
     class_names = ["no_tumor", "glioma", "meningioma", "pituitary"]
     class_aliases = {
-        "notumor": "no_tumor", "no_tumor": "no_tumor", "no-tumor": "no_tumor", "normal": "no_tumor", "healthy": "no_tumor",
+        "notumor": "no_tumor", "no_tumor": "no_tumor", "normal": "no_tumor", "healthy": "no_tumor",
         "glioma": "glioma", "gl": "glioma",
         "meningioma": "meningioma", "me": "meningioma",
         "pituitary": "pituitary", "pi": "pituitary",
     }
+
+    all_images = []
+    for ext in ["*.jpg", "*.jpeg", "*.png"]:
+        for p in data_path.rglob(ext):
+            parts_lower = [part.lower() for part in p.parts]
+            if "mask" in p.name.lower() or "masks" in parts_lower:
+                continue
+            all_images.append(p)
 
     print(f"Discovered {len(all_images):,} total MRI image scans across subfolders.")
 
@@ -745,7 +698,7 @@ def scan_all_dataset_folders(data_dir: Union[str, Path] = "data", max_samples_pe
         stem_lower = p.stem.lower()
         matched = None
         for alias, cls in class_aliases.items():
-            if any(alias in part for part in parts_lower) or f"_{alias}_" in stem_lower or stem_lower.startswith(f"{alias}_"):
+            if alias in parts_lower or f"_{alias}_" in stem_lower or stem_lower.startswith(f"{alias}_"):
                 matched = cls
                 break
         if matched:
@@ -893,31 +846,21 @@ def crawl_all_folders(data_dir: Union[str, Path] = "data") -> pd.DataFrame:
     """Recursively walks every folder in data_dir to discover all MRI scans,
     matches labels from directory names or filename tokens, and pairs masks when present.
     """
-    candidates = [
-        Path(data_dir),
-        Path.cwd() / "data",
-        Path("/content/data"),
-        Path("/content/Early-Brain-Tumor-Detection/data"),
-        Path.cwd()
-    ]
-
-    all_images = []
-    for cand in candidates:
-        if cand.is_dir():
-            imgs = [
-                p for ext in ["*.jpg", "*.jpeg", "*.png"]
-                for p in cand.rglob(ext)
-                if "mask" not in p.name.lower() and "masks" not in [x.lower() for x in p.parts]
-            ]
-            if len(imgs) > len(all_images):
-                all_images = imgs
-
+    data_path = Path(data_dir)
     class_aliases = {
-        "notumor": "no_tumor", "no_tumor": "no_tumor", "no-tumor": "no_tumor", "normal": "no_tumor", "healthy": "no_tumor",
+        "notumor": "no_tumor", "no_tumor": "no_tumor", "normal": "no_tumor", "healthy": "no_tumor",
         "glioma": "glioma", "gl": "glioma",
         "meningioma": "meningioma", "me": "meningioma",
         "pituitary": "pituitary", "pi": "pituitary",
     }
+
+    all_images = []
+    for ext in ["*.jpg", "*.jpeg", "*.png"]:
+        for p in data_path.rglob(ext):
+            parts_lower = [part.lower() for part in p.parts]
+            if "mask" in p.name.lower() or "masks" in parts_lower:
+                continue
+            all_images.append(p)
 
     records = []
     for p in all_images:
@@ -926,7 +869,7 @@ def crawl_all_folders(data_dir: Union[str, Path] = "data") -> pd.DataFrame:
 
         matched_label = None
         for alias, cls_name in class_aliases.items():
-            if any(alias in part for part in parts_lower) or f"_{alias}_" in stem_lower or stem_lower.startswith(f"{alias}_"):
+            if alias in parts_lower or f"_{alias}_" in stem_lower or stem_lower.startswith(f"{alias}_"):
                 matched_label = cls_name
                 break
 
@@ -1008,10 +951,7 @@ class UniversalBrainTumorDataset(Dataset):
         row = self.df.iloc[idx]
         img_p = resolve_file_path(row["image_path"], self.data_root)
         if img_p is None or not img_p.is_file():
-            if Path(row["image_path"]).is_file():
-                img_p = Path(row["image_path"])
-            else:
-                raise FileNotFoundError(f"Cannot find MRI scan at: {row['image_path']}")
+            raise FileNotFoundError(f"Cannot find MRI scan at: {row['image_path']}")
 
         img_pil = Image.open(img_p).convert("L")
         has_mask = bool(row.get("has_mask", False))
@@ -1084,10 +1024,7 @@ class BrainTumorDataset(Dataset):
         row = self.df.iloc[idx]
         img_p = resolve_file_path(row["image_path"], self.data_root)
         if img_p is None or not img_p.is_file():
-            if Path(row["image_path"]).is_file():
-                img_p = Path(row["image_path"])
-            else:
-                raise FileNotFoundError(f"Cannot find MRI scan at: {row['image_path']}")
+            raise FileNotFoundError(f"Cannot find MRI scan at: {row['image_path']}")
 
         img_pil = Image.open(img_p).convert("L")
 
@@ -1163,66 +1100,7 @@ def compute_expected_calibration_error(y_true: np.ndarray, y_probs: np.ndarray, 
     return float(ece), bin_accs, bin_confs
 
 
-def compute_bootstrap_confidence_intervals(
-    y_true: np.ndarray, y_pred: np.ndarray, y_probs: Optional[np.ndarray] = None,
-    n_bootstraps: int = 1000, confidence_level: float = 0.95, seed: int = 42
-) -> Dict[str, Tuple[float, float]]:
-    """Calculates non-parametric percentile bootstrap 95% Confidence Intervals."""
-    rng = np.random.RandomState(seed)
-    n_samples = len(y_true)
-    alpha_lower = (1.0 - confidence_level) / 2.0 * 100.0
-    alpha_upper = (1.0 + confidence_level) / 2.0 * 100.0
-
-    boot_acc, boot_bal_acc, boot_macro_f1, boot_weighted_f1 = [], [], [], []
-    boot_macro_prec, boot_macro_rec, boot_mcc, boot_kappa, boot_auc = [], [], [], [], []
-
-    for _ in range(n_bootstraps):
-        indices = rng.randint(0, n_samples, size=n_samples)
-        b_true = y_true[indices]
-        b_pred = y_pred[indices]
-
-        if len(np.unique(b_true)) < 2:
-            continue
-
-        boot_acc.append(accuracy_score(b_true, b_pred))
-        boot_bal_acc.append(balanced_accuracy_score(b_true, b_pred))
-        boot_macro_f1.append(f1_score(b_true, b_pred, average="macro", zero_division=0))
-        boot_weighted_f1.append(f1_score(b_true, b_pred, average="weighted", zero_division=0))
-        boot_macro_prec.append(precision_score(b_true, b_pred, average="macro", zero_division=0))
-        boot_macro_rec.append(recall_score(b_true, b_pred, average="macro", zero_division=0))
-        boot_mcc.append(matthews_corrcoef(b_true, b_pred))
-        boot_kappa.append(cohen_kappa_score(b_true, b_pred))
-
-        if y_probs is not None:
-            try:
-                boot_auc.append(roc_auc_score(b_true, y_probs[indices], multi_class="ovr", average="macro"))
-            except Exception:
-                pass
-
-    def get_ci(vals: List[float]) -> Tuple[float, float]:
-        if len(vals) == 0:
-            return (0.0, 0.0)
-        return (float(np.percentile(vals, alpha_lower)), float(np.percentile(vals, alpha_upper)))
-
-    ci_results = {
-        "accuracy": get_ci(boot_acc),
-        "balanced_accuracy": get_ci(boot_bal_acc),
-        "macro_f1": get_ci(boot_macro_f1),
-        "weighted_f1": get_ci(boot_weighted_f1),
-        "macro_precision": get_ci(boot_macro_prec),
-        "macro_recall": get_ci(boot_macro_rec),
-        "matthews_corrcoef": get_ci(boot_mcc),
-        "cohen_kappa": get_ci(boot_kappa),
-    }
-    if len(boot_auc) > 0:
-        ci_results["auc_roc"] = get_ci(boot_auc)
-    return ci_results
-
-
-def compute_all_metrics(
-    y_true: np.ndarray, y_pred: np.ndarray, y_probs: np.ndarray,
-    uncertainties: np.ndarray, compute_bootstrap: bool = True, n_bootstraps: int = 1000
-):
+def compute_all_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_probs: np.ndarray, uncertainties: np.ndarray):
     cm = confusion_matrix(y_true, y_pred, labels=list(range(4)))
     acc = float(accuracy_score(y_true, y_pred))
     bal_acc = float(balanced_accuracy_score(y_true, y_pred))
@@ -1246,10 +1124,6 @@ def compute_all_metrics(
     except:
         auc_roc = 0.0
 
-    # Multi-Class Brier Score
-    y_onehot = np.eye(4)[y_true]
-    brier_score = float(np.mean(np.sum((y_onehot - y_probs) ** 2, axis=1)))
-
     ece, bin_accs, bin_confs = compute_expected_calibration_error(y_true, y_probs)
 
     correct_mask = (y_pred == y_true)
@@ -1258,21 +1132,14 @@ def compute_all_metrics(
 
     t_stat, p_val = stats.ttest_ind(unc_error, unc_correct, equal_var=False) if len(unc_error) > 1 and len(unc_correct) > 1 else (0.0, 1.0)
 
-    res = {
+    return {
         "accuracy": acc, "balanced_accuracy": bal_acc, "matthews_corrcoef": mcc, "cohen_kappa": kappa,
         "macro_precision": macro_prec, "macro_recall": macro_rec, "macro_specificity": macro_spec,
-        "macro_f1": macro_f1, "weighted_f1": weighted_f1, "auc_roc": auc_roc, "brier_score": brier_score,
+        "macro_f1": macro_f1, "weighted_f1": weighted_f1, "auc_roc": auc_roc,
         "expected_calibration_error": ece, "bin_accs": bin_accs, "bin_confs": bin_confs,
         "confusion_matrix": cm, "mean_unc_correct": float(np.mean(unc_correct)),
         "mean_unc_error": float(np.mean(unc_error)), "uncertainty_p_value": float(p_val)
     }
-
-    if compute_bootstrap:
-        res["bootstrap_ci"] = compute_bootstrap_confidence_intervals(
-            y_true=y_true, y_pred=y_pred, y_probs=y_probs, n_bootstraps=n_bootstraps
-        )
-
-    return res
 
 
 def compute_segmentation_dice(pred_masks: np.ndarray, true_masks: np.ndarray, threshold: float = 0.5):
@@ -1453,7 +1320,7 @@ def generate_all_7_figures(metrics: Dict, y_true: np.ndarray, y_probs: np.ndarra
 # STEP 5: DEEP MULTI-TASK TRAINING PIPELINE (WITH WARMUP & FOCAL LOSS)
 # ==============================================================================
 
-def train_and_evaluate_pipeline(epochs=30, batch_size=24, lr=3e-4, warmup_epochs=3, dataset_mode="universal"):
+def train_and_evaluate_pipeline(epochs=30, batch_size=24, lr=3e-4, warmup_epochs=3, dataset_mode="auto"):
     """Executes high-capacity training with Linear Warmup, Focal Evidential Loss, and TTA."""
     print(f"\n{'='*75}\n[STEP 1/3] PROFILING DATASET FOLDERS & LEARNING RADIOLOGICAL SIGNATURES\n{'='*75}")
     profiles, raw_feats = scan_all_dataset_folders(data_dir="data", max_samples_per_folder=100)
@@ -1488,16 +1355,8 @@ def train_and_evaluate_pipeline(epochs=30, batch_size=24, lr=3e-4, warmup_epochs
             test_ds = UniversalBrainTumorDataset(data_dir="data", split="test", is_training=False)
             small_ds = test_ds
 
-    num_workers = 2 if device.type == 'cuda' else 0
-    train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, drop_last=True,
-        num_workers=num_workers, pin_memory=(device.type == 'cuda'),
-        persistent_workers=(num_workers > 0)
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, persistent_workers=(num_workers > 0)
-    )
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=2 if device.type == 'cuda' else 0, pin_memory=(device.type == 'cuda'))
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=2 if device.type == 'cuda' else 0)
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
     small_loader = DataLoader(small_ds, batch_size=batch_size, shuffle=False)
 
@@ -1675,34 +1534,24 @@ def train_and_evaluate_pipeline(epochs=30, batch_size=24, lr=3e-4, warmup_epochs
     print(f"Small-Tumour Macro F1:     {small_metrics['macro_f1']*100:.2f}%")
     print(f"=======================================================\n")
 
-    # Export Publication-Grade LaTeX Table with 95% Bootstrap Confidence Intervals
-    ci = test_metrics.get("bootstrap_ci", {})
-    def fmt_m(key, mult=100.0, dec=2):
-        v = test_metrics.get(key, 0.0) * mult
-        if key in ci:
-            l, h = ci[key][0] * mult, ci[key][1] * mult
-            return f"{v:.{dec}f} [{l:.{dec}f}, {h:.{dec}f}]"
-        return f"{v:.{dec}f}"
-
-    latex_table = f"""% Auto-generated IEEE/Nature Journal LaTeX Table with 95% Bootstrap Confidence Intervals
+    # Export Publication-Grade LaTeX Table
+    latex_table = f"""% Auto-generated IEEE/Nature Journal LaTeX Table
 \\begin{{table}}[htbp]
 \\centering
-\\caption{{Quantitative Multi-Task Evaluation of X-R-MiTNet (v2) on Brain Tumor Detection & Auxiliary Segmentation (Mean [95\\% CI])}}
+\\caption{{Quantitative Multi-Task Evaluation of X-R-MiTNet (v2) on Brain Tumor Detection & Auxiliary Segmentation}}
 \\label{{tab:tumor_results}}
 \\begin{{tabular}}{{lc|lc}}
-\\toprule
-\\textbf{{Metric}} & \\textbf{{Score (95\\% CI)}} & \\textbf{{Metric}} & \\textbf{{Score (95\\% CI)}} \\\\
-\\midrule
-Accuracy & {fmt_m('accuracy')}\\% & Balanced Accuracy & {fmt_m('balanced_accuracy')}\\% \\\\
-Macro F1-Score & {fmt_m('macro_f1')}\\% & Weighted F1-Score & {fmt_m('weighted_f1')}\\% \\\\
-Macro Specificity & {test_metrics['macro_specificity']*100:.2f}\\% & Macro Precision & {fmt_m('macro_precision')}\\% \\\\
-Macro Sensitivity (Recall) & {fmt_m('macro_recall')}\\% & AUC-ROC (OvR) & {fmt_m('auc_roc', 1.0, 4)} \\\\
-Cohen's Kappa ($\\kappa$) & {fmt_m('cohen_kappa', 1.0, 4)} & Matthews Corr (MCC) & {fmt_m('matthews_corrcoef', 1.0, 4)} \\\\
-Expected Calib Error (ECE) & {test_metrics['expected_calibration_error']:.4f} & Brier Score & {test_metrics.get('brier_score', 0.0):.4f} \\\\
+\\hline
+\\textbf{{Metric}} & \\textbf{{Score}} & \\textbf{{Metric}} & \\textbf{{Score}} \\\\
+\\hline
+Accuracy & {test_metrics['accuracy']*100:.2f}\\% & Balanced Accuracy & {test_metrics['balanced_accuracy']*100:.2f}\\% \\\\
+Macro F1-Score & {test_metrics['macro_f1']*100:.2f}\\% & Weighted F1-Score & {test_metrics['weighted_f1']*100:.2f}\\% \\\\
+Macro Specificity & {test_metrics['macro_specificity']*100:.2f}\\% & Macro Precision & {test_metrics['macro_precision']*100:.2f}\\% \\\\
+Macro Sensitivity (Recall) & {test_metrics['macro_recall']*100:.2f}\\% & AUC-ROC (OvR) & {test_metrics['auc_roc']:.4f} \\\\
+Cohen's Kappa ($\\kappa$) & {test_metrics['cohen_kappa']:.4f} & Matthews Corr (MCC) & {test_metrics['matthews_corrcoef']:.4f} \\\\
+Expected Calib Error (ECE) & {test_metrics['expected_calibration_error']:.4f} & Small-Tumor Recall & {small_metrics['macro_recall']*100:.2f}\\% \\\\
 Auxiliary Dice Score & {dice_score*100:.2f}\\% & Auxiliary IoU (Jaccard) & {iou_score*100:.2f}\\% \\\\
-\\midrule
-Small-Tumor Recall & {small_metrics['macro_recall']*100:.2f}\\% & Small-Tumor Macro F1 & {small_metrics['macro_f1']*100:.2f}\\% \\\\
-\\bottomrule
+\\hline
 \\end{{tabular}}
 \\end{{table}}
 """
@@ -1751,7 +1600,12 @@ class InteractiveDiagnosticEngine:
             self.model.load_state_dict(torch.load(model_path, map_location=device))
         self.model.eval()
 
-    def analyze_image(self, pil_image: Image.Image, discard_ratio: float = 0.85):
+    def analyze_image(self, pil_image, discard_ratio: float = 0.85):
+        from PIL import Image as PILImage
+        if isinstance(pil_image, np.ndarray):
+            pil_image = PILImage.fromarray(pil_image)
+        elif not hasattr(pil_image, "convert"):
+            pil_image = PILImage.open(pil_image)
         norm = preprocess_mri_medical(pil_image, apply_clahe=True)
         tensor = torch.from_numpy(norm).unsqueeze(0).unsqueeze(0).to(device)
 
@@ -1823,6 +1677,10 @@ def launch_in_notebook_uploader():
 
 def launch_gradio_web_app():
     import gradio as gr
+    try:
+        gr.close_all()
+    except Exception:
+        pass
     engine = InteractiveDiagnosticEngine()
 
     def predict_gradio(img, discard_ratio):
@@ -1850,44 +1708,21 @@ def launch_gradio_web_app():
 
         btn.click(predict_gradio, inputs=[input_img, discard_s], outputs=[conf_out, md_out, v1, v2, v3])
 
-    demo.launch(inline=True, share=True)
+    print("[*] Gradio server is starting on 0.0.0.0... Open the public link below in a new tab:")
+    demo.launch(server_name="0.0.0.0", server_port=7860, share=True, inline=False)
 
 
 # ==============================================================================
 # EXECUTION ENTRY POINT
 # ==============================================================================
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Train X-R-MiTNet (v2) on Colab/Local")
-    parser.add_argument("--epochs", type=int, default=30, help="Number of epochs to train (default: 30)")
-    parser.add_argument("--batch_size", type=int, default=24, help="Batch size for training (default: 24)")
-    parser.add_argument("--lr", type=float, default=3e-4, help="Initial learning rate (default: 3e-4)")
-    parser.add_argument("--warmup_epochs", type=int, default=3, help="Number of warmup epochs (default: 3)")
-    parser.add_argument("--dataset_mode", type=str, default="universal", help="Dataset mode: universal or standard")
-    parser.add_argument("--data_dir", type=str, default="data", help="Directory where dataset images are located")
-    parser.add_argument("--no_gradio", action="store_true", help="Skip launching Gradio web app")
-    args, unknown = parser.parse_known_args()
-
-    # Deep Multi-Task Training with Warmup and Focal Evidential Loss across all subfolders
-    trained_model = train_and_evaluate_pipeline(
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        warmup_epochs=args.warmup_epochs,
-        dataset_mode=args.dataset_mode
-    )
+    # Deep Multi-Task Training with Warmup and Focal Evidential Loss
+    trained_model = train_and_evaluate_pipeline(epochs=30, batch_size=24, lr=3e-4, warmup_epochs=3)
 
     # In-Notebook Interactive Uploader
     print("\n[Launching In-Notebook Interactive Uploader Widget]")
-    try:
-        launch_in_notebook_uploader()
-    except Exception as e:
-        print(f"Uploader widget skipped: {e}")
+    launch_in_notebook_uploader()
 
     # Public Gradio Web Application
-    if not args.no_gradio:
-        print("\n[Launching Gradio Public Web Application]")
-        try:
-            launch_gradio_web_app()
-        except Exception as e:
-            print(f"Gradio app skipped: {e}")
+    print("\n[Launching Gradio Public Web Application]")
+    launch_gradio_web_app()

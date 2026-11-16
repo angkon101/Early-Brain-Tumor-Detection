@@ -65,6 +65,7 @@ checkpoints/
 *.csv
 !data/splits/*.csv
 !data/metadata/*.csv
+data_colab/
 
 # Experiment tracking & logs
 runs/
